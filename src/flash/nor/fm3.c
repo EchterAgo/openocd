@@ -17,6 +17,7 @@
 #include <helper/binarybuffer.h>
 #include <target/algorithm.h>
 #include <target/armv7m.h>
+#include <target/cortex_m.h>
 #include <target/register.h>
 #include <helper/time_support.h>
 #include <target/arm_adi_v5.h>
@@ -228,6 +229,61 @@ static int fm3_busy_wait(struct target *target, uint32_t offset, int timeout_ms)
 	return retval;
 }
 
+/* Drive a locked-up/halted FM3 core into a CLEAN debug halt.
+ * DHCSR bits: 16 S_HALT, 18 S_LOCKUP. DCRSR register access is
+ * dead during lockup; BIT(7)(7) exits it. */
+static int fm3_type9_force_halt(struct target *target)
+{
+	struct adiv5_ap *dap = target_to_armv7m(target)->debug_ap;
+	unsigned int clean = 0;
+	for (unsigned int i = 0; i < 400; i++) {
+		uint32_t dhcsr;
+		keep_alive();
+		if (mem_ap_read_atomic_u32(dap, DCB_DHCSR, &dhcsr) != ERROR_OK)
+			continue;
+		if (!(dhcsr & S_HALT)) {
+			/* running: plain debug halt, never clear S_REGRDY
+			 * (bit 0) in a request write — it can bounce. */
+			mem_ap_write_atomic_u32(dap, DCB_DHCSR,
+					 DBGKEY | C_HALT | C_DEBUGEN);
+			clean = 0;
+			continue;
+		}
+		if (dhcsr & S_LOCKUP) {
+			mem_ap_write_atomic_u32(dap, DCB_DHCSR,
+					 DBGKEY | C_HALT | C_DEBUGEN |
+					 BIT(7));
+			clean = 0;
+			continue;
+		}
+		if (dhcsr & S_SLEEP) {
+			/* eject sleep so openocd's start-path can't hand the
+			 * core over while it sits in WFI */
+			mem_ap_write_atomic_u32(dap, DCB_DHCSR,
+					 DBGKEY | C_DEBUGEN);
+			for (unsigned int w = 0; w < 30; w++) {
+				uint32_t idle;
+				mem_ap_read_atomic_u32(dap, 0xE000EDCC, &idle);
+			}
+			mem_ap_write_atomic_u32(dap, DCB_DHCSR,
+					 DBGKEY | C_HALT | C_DEBUGEN);
+			clean = 0;
+			continue;
+		}
+		if (++clean < 3)
+			continue;
+		/* stable clean halt: disarm MPU + fault state */
+		mem_ap_write_atomic_u32(dap, 0xE000ED94, 0);	/* MPU_CTRL */
+		mem_ap_write_atomic_u32(dap, 0xE000ED2C, 0xFFFFFFFF);	/* HFSR */
+		mem_ap_write_atomic_u32(dap, 0xE000ED28, 0xFFFFFFFF);	/* CFSR */
+		mem_ap_write_atomic_u32(dap, 0xE000ED30, 0xFFFFFFFF);	/* DFSR */
+		mem_ap_write_atomic_u32(dap, 0xE000EF00, 0xFFFFFFFF);	/* ICER */
+		mem_ap_write_atomic_u32(dap, 0xE000E280, 0xFFFFFFFF);	/* ICPR */
+		return ERROR_OK;
+	}
+	return ERROR_FAIL;
+}
+
 static int fm3_erase(struct flash_bank *bank, unsigned int first,
 		unsigned int last)
 {
@@ -248,6 +304,10 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
 		/* Pure host-side sequence (mirrors vendor bootloader). */
+		if (fm3_type9_force_halt(target) != ERROR_OK) {
+			LOG_ERROR("fm3 type9: cannot force halt before erase");
+			return ERROR_FAIL;
+		}
 		retval = fm3_type9_reset(target);
 		if (retval != ERROR_OK)
 			return retval;
@@ -528,6 +588,17 @@ static const uint8_t t9_stub[] = {
 	0xe1, 0xe7, 0x00, 0xbe, 0xbd, 0xe8, 0xf0, 0x93,
 };
 
+/* Force the core into a *verified* halt through the debug AP. A core
+ * suspended on a flash-bus transaction (read-while-write in the bank
+ * aperture) is invisible to cached openocd state and to a single DHCSR
+ * read; C_HALT+timeout-poll is the only trustworthy check. */
+/* Force the core into a *verified* halt through the debug AP. A core
+ * suspended on a flash-bus transaction (read-while-write in the bank
+ * aperture) is invisible to cached openocd state; request halt and
+ * poll DHCSR through the AP, letting the AP transaction cost itself
+ * pace the loop (no sleeps). */
+
+
 static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		uint32_t offset, uint32_t count)
 {
@@ -710,8 +781,6 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	if (retval != ERROR_OK)
 		return retval;
 
-	count = count / 2;		/* number bytes -> number halfwords */
-
 	/* check code alignment */
 	if (offset & 0x1) {
 		LOG_WARNING("offset 0x%" PRIx32 " breaks required 2-byte alignment", offset);
@@ -719,6 +788,11 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	}
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
+		if (fm3_type9_force_halt(target) != ERROR_OK) {
+			LOG_ERROR("fm3 type9: cannot force core into verified halt "
+				  "(bus-suspended?) — power-cycle required");
+			return ERROR_FAIL;
+		}
 		retval = fm3_type9_reset(target);
 		if (retval != ERROR_OK) {
 			LOG_ERROR("fm3 type9: macro reset failed");
@@ -731,13 +805,20 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		struct armv7m_algorithm armv7m_algo;
 		struct reg_param rp[3];
 		struct adiv5_ap *dap = target_to_armv7m(target)->debug_ap;
+		/* The app's idle loop leaves SLEEPDEEP armed: a RESUME_SLEEP
+		 * re-sleeps the core instantly and our preload races it. Kill
+		 * deep-sleep and force a plain halt before arming the stub. */
+		mem_ap_write_atomic_u32(dap, 0xE000ED10, 0);	/* SCR */
+		mem_ap_write_atomic_u32(dap, 0xE000EDF0, 0xA05F0003);	/* C_HALT */
+
 		const uint32_t t9_code = 0x1FFFC100;
 		const uint32_t t9_ctrl = 0x1FFFC400;
 		const uint32_t t9_ring = 0x1FFFC800;
 		const uint32_t t9_size = 8192;
 		const uint32_t t9_exit = t9_code + 0x56;
 		const uint32_t total = count & ~3u;	/* whole words via ring */
-		uint32_t wr = 0, rd = 0;
+		uint32_t wr = 0, rd = 0, rd_seen = 0xFFFFFFFF;
+		int64_t t_noprog = timeval_ms();
 		int64_t t_start;
 		bool started = false;
 
@@ -747,6 +828,13 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 
 		static const uint8_t zeros[12];	/* ctrl: wr rd stop */
 		retval = target_write_buffer(target, t9_ctrl, sizeof(zeros), zeros);
+		/* BKPT during the algorithm lands in the VTOR table armed
+		 * by start_algorithm at the work area: b . + bkpt. Ensure
+		 * the island's reset-vector slot can't trap us: write a
+		 * plain bx lr sentinel trampoline at 0x1FFFC000 (harmless
+		 * dead word for the stub flow, rescue for strays). */
+		if (retval == ERROR_OK)
+			retval = target_write_u16(target, 0x1FFFC000, 0x4770);
 		if (retval == ERROR_OK)
 			retval = target_write_buffer(target, t9_code, sizeof(t9_stub), t9_stub);
 		if (retval == ERROR_OK && total > 0) {
@@ -767,6 +855,51 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		buf_set_u32(rp[1].value, 0, 32, t9_ring);
 		buf_set_u32(rp[2].value, 0, 32, t9_ctrl);
 
+		/* OpenOCD's start_algorithm no longer arms any vector
+		 * table; the app's VTOR (island @0x1FFFC000) is trashed by
+		 * our preload, so any fault/bkpt-driven fetch would lock us
+		 * up. Arm a throwaway table in RAM1 (data-accessible, not
+		 * executable): every exception = immediate bkpt, which
+		 * halts the core for our watchdog to report. */
+		{
+			const uint32_t t9_vectors = 0x20002000;
+			uint8_t vtab[64 * 4];
+			for (unsigned int v = 0; v < 64; v++) {
+				uint32_t h = (t9_code + 0x60) | 1u;
+				vtab[v * 4 + 0] = h & 0xff;
+				vtab[v * 4 + 1] = (h >> 8) & 0xff;
+				vtab[v * 4 + 2] = (h >> 16) & 0xff;
+				vtab[v * 4 + 3] = (h >> 24) & 0xff;
+			}
+			vtab[0] = 0; vtab[1] = 0; vtab[2] = 0; vtab[3] = 0; /* SP unused path */
+			/* handler: bkpt #1 at stub end + 0x60 */
+			uint8_t hk[2] = { 0x01, 0xbe };
+			retval = target_write_buffer(target, t9_code + 0x60, 2, hk);
+			if (retval == ERROR_OK)
+				retval = target_write_buffer(target, t9_vectors,
+						       sizeof(vtab), vtab);
+			if (retval == ERROR_OK)
+				retval = mem_ap_write_atomic_u32(dap, 0xE000ED08,
+							     t9_vectors);
+			if (retval != ERROR_OK) {
+				LOG_ERROR("fm3 type9: vector arming failed");
+				return retval;
+			}
+		}
+		/* Right before the handoff: make certain the core sits in a
+		 * plain debug-halt (clear sleep+sleepdeep, force halt) so the
+		 * algorithm resume can't bounce into app code or WFI. */
+		mem_ap_write_atomic_u32(dap, 0xE000EDF0, 0xA05F0003);
+		mem_ap_write_atomic_u32(dap, 0xE000ED10, 0);	/* SCR: no SLEEPDEEP */
+		/* Target may have slept (app WFI) since our entry halt; use
+		 * OpenOCD's own halt+wait so start_algorithm sees a plain
+		 * halted core and its resume doesn't bounce off SLEEP state. */
+		if (fm3_type9_force_halt(target) != ERROR_OK ||
+		    target_wait_state(target, TARGET_HALTED, 2000) != ERROR_OK) {
+			LOG_ERROR("fm3 type9: pre-start halt wait failed");
+			retval = ERROR_FAIL;
+			goto t9_err;
+		}
 		retval = target_start_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
 						t9_code | 1, t9_exit, &armv7m_algo);
 		if (retval != ERROR_OK) {
@@ -774,20 +907,87 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 			goto t9_err;
 		}
 		started = true;
-
 		t_start = timeval_ms();
 		while (wr < total) {
 			retval = mem_ap_read_atomic_u32(dap, t9_ctrl + 4, &rd);
 			if (retval != ERROR_OK)
 				goto t9_err;
+			if (rd != rd_seen) {
+				rd_seen = rd;
+				t_noprog = timeval_ms();
+			}
 			if (wr - rd > t9_size - 2048) {
-				/* ring near full; occupancy of monotonic counters */
-				target_poll(target);
-				if (target->state == TARGET_HALTED) {
-					LOG_ERROR("fm3 type9: stub exited early (rd=%" PRIu32
-						  " of %" PRIu32 ")", rd, wr);
-					retval = ERROR_FLASH_OPERATION_FAILED;
-					goto t9_err;
+				/* ring near full; occupancy of monotonic counters.
+				 * Liveness from the LIVE DHCSR.S_HALT (cached openocd
+				 * state lies after lockup-clear) plus rd progress:
+				 * the consumer advances rd every ~12 us, so 5000 AP
+				 * reads (~0.5 s) without movement is a real fault. */
+				/* Only judge liveness after sustained zero
+				 * progress; DHCSR sampled from the running
+				 * core is unreliable and spawned phantom
+				 * "exited early" reports. */
+				if (timeval_ms() - t_noprog > 3000) {
+					uint32_t dhcsr = 0;
+					if (mem_ap_read_atomic_u32(dap, 0xE000EDF0,
+								   &dhcsr) != ERROR_OK) {
+						LOG_ERROR("fm3 type9: AP read failed (chip stuck?)");
+						retval = ERROR_FLASH_OPERATION_FAILED;
+						goto t9_err;
+					}
+					if (!(dhcsr & (1u << 16))) {
+						/* still running: keep waiting */
+					} else {
+						uint32_t macro_fstr = 0xDEAD, macro_fisr = 0xDEAD;
+						mem_ap_read_atomic_u32(dap, 0x40000008, &macro_fstr);
+						mem_ap_read_atomic_u32(dap, 0x40000024, &macro_fisr);
+						LOG_INFO("t9 macro at watchdog: FSTR=%08x FISR=%08x",
+							 macro_fstr, macro_fisr);
+						uint32_t dfsr = 0, hfsr = 0,
+							 cfsr = 0, mmfar = 0, bfar = 0;
+						uint32_t pc = 0, lr = 0, sp = 0, xpsr = 0;
+						uint32_t regs[4] = { 15, 14, 13, 16 };
+						uint32_t *outp[4] = { &pc, &lr, &sp, &xpsr };
+						for (unsigned rr = 0; rr < 4; rr++) {
+							mem_ap_write_atomic_u32(dap, 0xE000EDF0,
+									  (1u << 16) | regs[rr]);
+							for (unsigned pp = 0; pp < 50; pp++) {
+								uint32_t d, v = 0;
+								if (mem_ap_read_atomic_u32(dap, 0xE000EDF0, &d)
+								    != ERROR_OK)
+									break;
+								if (!(d & 1u))
+									continue;
+								if (mem_ap_read_atomic_u32(dap, 0xE000EDF4, &v)
+								    == ERROR_OK) {
+									*outp[rr] = v;
+									break;
+								}
+							}
+						}
+						mem_ap_read_atomic_u32(dap, 0xE000ED30, &dfsr);
+						mem_ap_read_atomic_u32(dap, 0xE000ED2C, &hfsr);
+						mem_ap_read_atomic_u32(dap, 0xE000ED28, &cfsr);
+						mem_ap_read_atomic_u32(dap, 0xE000ED34, &mmfar);
+						mem_ap_read_atomic_u32(dap, 0xE000ED38, &bfar);
+						uint32_t dhcsr_now = 0;
+						mem_ap_read_atomic_u32(dap, 0xE000EDF0,
+							     &dhcsr_now);
+						LOG_ERROR("fm3 type9: stub exited early (rd=%" PRIu32
+							  " of %" PRIu32 ") DHCSR=%08x PC=%08x "
+							  "LR=%08x SP=%08x xPSR=%08x HFSR=%08x CFSR=%08x",
+							  rd, wr, dhcsr_now, pc, lr, sp, xpsr,
+							  hfsr, cfsr);
+							uint32_t cw = 0, cr = 0, cs = 0, rh0 = 0, rh1 = 0;
+						mem_ap_read_atomic_u32(dap, t9_ctrl + 0, &cw);
+						mem_ap_read_atomic_u32(dap, t9_ctrl + 4, &cr);
+						mem_ap_read_atomic_u32(dap, t9_ctrl + 8, &cs);
+						mem_ap_read_atomic_u32(dap, t9_ring + 0, &rh0);
+						mem_ap_read_atomic_u32(dap, t9_ring + 4, &rh1);
+						LOG_ERROR("t9 ring state: ctrl wr=%u rd=%u stop=%u ring[0]=%08x ring[4]=%08x (expect wr=8192)",
+							  cw, cr, cs, rh0, rh1);
+						retval = ERROR_FLASH_OPERATION_FAILED;
+						goto t9_err;
+					}
 				}
 				if (timeval_ms() - t_start > 60000) {
 					uint32_t fisr = 0, fstr = 0;
@@ -872,6 +1072,9 @@ t9_err:
 		destroy_reg_param(&rp[2]);
 		return retval != ERROR_OK ? retval : ERROR_FLASH_OPERATION_FAILED;
 	}
+
+	/* legacy FM3 algorithms count halfwords */
+	count = count / 2;
 
 	/* allocate working area and variables with flash programming code */
 	if (target_alloc_working_area(target, sizeof(fm3_flash_write_code) + 8,
