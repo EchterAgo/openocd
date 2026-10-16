@@ -454,78 +454,56 @@ static int fm3_type9_reset(struct target *target)
 	return retval;
 }
 
-/* Type 9-12 RAM-island ring-consumer stub.
+/* Type 9-12 RAM-island serial stub (Thumb-2).
+ * Reassemble with: arm-none-eabi-as -mthumb -o t9.o t9_stub.S
+ *                  arm-none-eabi-objcopy -O binary t9.o t9_stub.bin
+ * (source verbatim below; 56 bytes, bkpt at +0x30.)
  *
- * Reassemble with: arm-none-eabi-as -mthumb -o t9_stub.o t9_stub.S
- *                  arm-none-eabi-objcopy -O binary t9_stub.o t9_stub.bin
- * (source kept verbatim below; 92 bytes, bkpt at +0x56).
- *
- * Must run from 0x1FFFC100, the vendor bootloader's own RAM-code
- * island: the 0x20000000 RAM is not executable on these parts, and
- * running from RAM block 0 faults on the flash aperture while the
- * macro is busy.  r0 = dst flash addr, r1 = 8 KB ring base,
- * r3 = ctrl block (u32 wr / u32 rd / u32 stop).  The loop pops one
- * halfword from the ring and runs the vendor per-halfword program
- * sequence (FSTR poll, AA/55/A0, strh); empty ring plus stop flag
- * exits via bkpt.  The host refills the ring through the debug AP
- * WHILE THIS STUB RUNS, so SWD upload overlaps macro programming.
+ * Serial-chunk design: host fills a 16 KB buffer while the core is
+ * halted, then one blocking algorithm run per chunk (r0=dst,
+ * r1=src, r2=halfword count) at 0x1FFFC100, the vendor RAM-code
+ * island (0x2000xxxx is not executable on these parts).
  *
  * 	.syntax unified
  * 	.thumb
  * 	.thumb_func
- * # r0=dst flash, r1=ring base (8KB, mask 0x1FFF), r3=ctrl block
- * # ctrl+0 wr(bytes) ctrl+4 rd(bytes) ctrl+8 stop
- * 	.global t9_ring
- * t9_ring:
+ * # r0=dst, r1=src, r2=halfword count ; vendor-faithful per-halfword program
+ * 	.global t9_program
+ * t9_program:
  * 	cpsid i
- * 	push {r4-r9,r12, lr}
- * 	movw r7, #0x0100
- * 	movt r7, #0x4200	@ FSTR bit-band alias 0x42000100
- * 	movw r8, #0x0AA8
- * 	movw r9, #0x0554
- * 	movw r12, #0x1FFF
+ * 	push {r4-r6, lr}
+ * 	movw r5, #0x0AA8
+ * 	movw r6, #0x0554
  * loop:
- * 	ldr r4, [r3, #0]	@ wr
- * 	ldr r5, [r3, #4]	@ rd
- * 	cmp r4, r5
- * 	bne have
- * 	ldr r2, [r3, #8]	@ stop
  * 	cmp r2, #0
- * 	bne done
- * 	b loop
- * have:
- * waitf:
- * 	ldrb r6, [r7]
- * 	cmp r6, #0
- * 	beq waitf
- * 	movs r6, #0xAA
- * 	strh r6, [r8]
- * 	movs r6, #0x55
- * 	strh r6, [r9]
- * 	movs r6, #0xA0
- * 	strh r6, [r8]
- * 	mov r6, r5
- * 	ands r6, r12
- * 	adds r6, r1
- * 	ldrh r4, [r6]
+ * 	beq done
+ * wait1:
+ * 	ldr r3, =0x42000100
+ * 	ldrb r4, [r3]
+ * 	cmp r4, #0
+ * 	beq wait1
+ * 	movs r4, #0xAA
+ * 	strh r4, [r5]
+ * 	movs r4, #0x55
+ * 	strh r4, [r6]
+ * 	movs r4, #0xA0
+ * 	strh r4, [r5]
+ * 	ldrh r4, [r1]
+ * 	adds r1, #2
  * 	strh r4, [r0]
  * 	adds r0, #2
- * 	adds r5, #2
- * 	str r5, [r3, #4]
+ * 	subs r2, #1
  * 	b loop
  * done:
  * 	bkpt #0
- * 	pop {r4-r9,r12, pc}
+ * 	pop {r4-r6, pc}
  */
 static const uint8_t t9_stub[] = {
-	0x72, 0xb6, 0x2d, 0xe9, 0xf0, 0x53, 0x40, 0xf2, 0x00, 0x17, 0xc4, 0xf2,
-	0x00, 0x27, 0x40, 0xf6, 0xa8, 0x28, 0x40, 0xf2, 0x54, 0x59, 0x41, 0xf6,
-	0xff, 0x7c, 0x1c, 0x68, 0x5d, 0x68, 0xac, 0x42, 0x03, 0xd1, 0x9a, 0x68,
-	0x00, 0x2a, 0x16, 0xd1, 0xf7, 0xe7, 0x3e, 0x78, 0x00, 0x2e, 0xfc, 0xd0,
-	0xaa, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x55, 0x26, 0xa9, 0xf8, 0x00, 0x60,
-	0xa0, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x2e, 0x46, 0x16, 0xea, 0x0c, 0x06,
-	0x76, 0x18, 0x34, 0x88, 0x04, 0x80, 0x02, 0x30, 0x02, 0x35, 0x5d, 0x60,
-	0xe1, 0xe7, 0x00, 0xbe, 0xbd, 0xe8, 0xf0, 0x93,
+	0x72, 0xb6, 0x70, 0xb5, 0x40, 0xf6, 0xa8, 0x25, 0x40, 0xf2, 0x54, 0x56,
+	0x00, 0x2a, 0x0f, 0xd0, 0x08, 0x4b, 0x1c, 0x78, 0x00, 0x2c, 0xfb, 0xd0,
+	0xaa, 0x24, 0x2c, 0x80, 0x55, 0x24, 0x34, 0x80, 0xa0, 0x24, 0x2c, 0x80,
+	0x0c, 0x88, 0x02, 0x31, 0x04, 0x80, 0x02, 0x30, 0x01, 0x3a, 0xed, 0xe7,
+	0x00, 0xbe, 0x70, 0xbd, 0x00, 0x01, 0x00, 0x42,
 };
 
 static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
@@ -720,157 +698,61 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
 		retval = fm3_type9_reset(target);
-		if (retval != ERROR_OK) {
-			LOG_ERROR("fm3 type9: macro reset failed");
+		if (retval != ERROR_OK)
 			return retval;
-		}
-		/* Pipelined ring program: the on-chip stub consumes an 8 KB ring
-		 * while we refill it through the debug AP with the core RUNNING.
-		 * Overrun is impossible (refill gated on the live rd pointer);
-		 * starvation is rate-impossible (SWD >> ~91 KB/s macro drain). */
+		/* Serial 16 KB chunks: bulk-load while halted, then one
+		 * blocking algorithm run per chunk. Deterministic where the
+		 * concurrent ring refill races (fm3-type9-ring branch). */
 		struct armv7m_algorithm armv7m_algo;
 		struct reg_param rp[3];
-		struct adiv5_ap *dap = target_to_armv7m(target)->debug_ap;
 		const uint32_t t9_code = 0x1FFFC100;
-		const uint32_t t9_ctrl = 0x1FFFC400;
-		const uint32_t t9_ring = 0x1FFFC800;
-		const uint32_t t9_size = 8192;
-		const uint32_t t9_exit = t9_code + 0x56;
-		const uint32_t total = count & ~3u;	/* whole words via ring */
-		uint32_t wr = 0, rd = 0;
-		int64_t t_start;
-		bool started = false;
+		const uint32_t t9_data = 0x1FFFC800;
 
 		memset(&armv7m_algo, 0, sizeof(armv7m_algo));
 		armv7m_algo.common_magic = ARMV7M_COMMON_MAGIC;
 		armv7m_algo.core_mode = ARM_MODE_THREAD;
 
-		static const uint8_t zeros[12];	/* ctrl: wr rd stop */
-		retval = target_write_buffer(target, t9_ctrl, sizeof(zeros), zeros);
-		if (retval == ERROR_OK)
-			retval = target_write_buffer(target, t9_code, sizeof(t9_stub), t9_stub);
-		if (retval == ERROR_OK && total > 0) {
-			wr = total < t9_size ? total : t9_size;
-			retval = target_write_buffer(target, t9_ring, wr, buffer);
-		}
-		if (retval == ERROR_OK)
-			retval = target_write_u32(target, t9_ctrl, wr);
-		if (retval != ERROR_OK) {
-			LOG_ERROR("fm3 type9: pipeline preload failed");
-			return retval;
-		}
+		for (uint32_t done = 0; done < count; ) {
+			uint32_t chunk = count - done;
+			if (chunk > 16384)
+				chunk = 16384;
 
-		init_reg_param(&rp[0], "r0", 32, PARAM_OUT);
-		init_reg_param(&rp[1], "r1", 32, PARAM_OUT);
-		init_reg_param(&rp[2], "r3", 32, PARAM_OUT);
-		buf_set_u32(rp[0].value, 0, 32, address);
-		buf_set_u32(rp[1].value, 0, 32, t9_ring);
-		buf_set_u32(rp[2].value, 0, 32, t9_ctrl);
-
-		retval = target_start_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
-						t9_code | 1, t9_exit, &armv7m_algo);
-		if (retval != ERROR_OK) {
-			LOG_ERROR("fm3 type9: pipeline stub start failed");
-			goto t9_err;
-		}
-		started = true;
-
-		t_start = timeval_ms();
-		while (wr < total) {
-			retval = mem_ap_read_atomic_u32(dap, t9_ctrl + 4, &rd);
-			if (retval != ERROR_OK)
-				goto t9_err;
-			if (wr - rd > t9_size - 2048) {
-				/* ring near full; occupancy of monotonic counters */
-				target_poll(target);
-				if (target->state == TARGET_HALTED) {
-					LOG_ERROR("fm3 type9: stub exited early (rd=%" PRIu32
-						  " of %" PRIu32 ")", rd, wr);
-					retval = ERROR_FLASH_OPERATION_FAILED;
-					goto t9_err;
-				}
-				if (timeval_ms() - t_start > 60000) {
-					uint32_t fisr = 0, fstr = 0;
-					target_read_u32(target, 0x40000024, &fisr);
-					target_read_u32(target, 0x40000008, &fstr);
-					LOG_ERROR("fm3 type9: pipeline stalled (wr=%" PRIu32 " rd=%" PRIu32
-						  " FSTR=%08" PRIx32 " FISR=%08" PRIx32 ")", wr, rd, fstr, fisr);
-					target_halt(target);
-					retval = ERROR_FLASH_OPERATION_FAILED;
-					goto t9_err;
-				}
-				keep_alive();
-				continue;
-			}
-			uint32_t slot = wr & (t9_size - 1);
-			uint32_t seg = 2048;
-			if (slot + seg > t9_size)
-				seg = t9_size - slot;
-			if (seg > total - wr)
-				seg = total - wr;
-			seg &= ~3u;
-			if (seg == 0)
-				seg = 4;	/* single word across wrap */
-			retval = t9_bulk_write(dap, t9_ring + slot, buffer + wr, seg);
-			if (retval != ERROR_OK)
-				goto t9_err;
-			wr += seg;
-			retval = mem_ap_write_atomic_u32(dap, t9_ctrl, wr);
-			if (retval != ERROR_OK)
-				goto t9_err;
-		}
-
-		{
-			uint32_t one = 1;
-			retval = mem_ap_write_atomic_u32(dap, t9_ctrl + 8, one);
-			if (retval != ERROR_OK)
-				goto t9_err;
-		}
-		retval = target_wait_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
-					     t9_exit, 30000, &armv7m_algo);
-		if (retval != ERROR_OK) {
-			LOG_ERROR("fm3 type9: ring stub did not complete cleanly");
-			started = false;
-			goto t9_err;
-		}
-		started = false;
-		destroy_reg_param(&rp[0]);
-		destroy_reg_param(&rp[1]);
-		destroy_reg_param(&rp[2]);
-
-		/* program any remaining 2-byte halfword directly (host side) */
-		for (uint32_t off = total; off < count; off += 2) {
-			uint16_t val = buffer[off] | (buffer[off + 1] << 8);
-			retval = fm3_fstr_wait(target, 500);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00AA);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00A0);
-			if (retval == ERROR_OK) retval = target_write_u16(target, address + off, val);
+			retval = target_write_buffer(target, t9_data, chunk, buffer + done);
+			if (retval == ERROR_OK)
+				retval = target_write_buffer(target, t9_code, sizeof(t9_stub), t9_stub);
 			if (retval != ERROR_OK) {
-				LOG_ERROR("fm3 type9: tail halfword failed");
+				LOG_ERROR("fm3 type9: stub/buffer load failed at %08" PRIx32,
+					  address + done);
 				return retval;
 			}
-			retval = fm3_fstr_wait(target, 1000);
-			if (retval != ERROR_OK)
+
+			init_reg_param(&rp[0], "r0", 32, PARAM_OUT);
+			init_reg_param(&rp[1], "r1", 32, PARAM_OUT);
+			init_reg_param(&rp[2], "r2", 32, PARAM_OUT);
+			buf_set_u32(rp[0].value, 0, 32, address + done);
+			buf_set_u32(rp[1].value, 0, 32, t9_data);
+			buf_set_u32(rp[2].value, 0, 32, chunk / 2);
+
+			retval = target_run_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
+							  t9_code | 1, t9_code + 0x30,
+							  30000, &armv7m_algo);
+
+			destroy_reg_param(&rp[0]);
+			destroy_reg_param(&rp[1]);
+			destroy_reg_param(&rp[2]);
+
+			if (retval != ERROR_OK) {
+				LOG_ERROR("fm3 type9: stub algorithm failed at %08" PRIx32,
+					  address + done);
 				return retval;
+			}
+			done += chunk;
+			keep_alive();
 		}
-		/* The island RAM we occupied may have been the app's live
-		 * vectors/code; never leave the core running after this. */
-		target_halt(target);
+
+		/* never resume into the trashed RAM island */
 		target_write_u32(target, 0xE000ED0C, 0x05FA0004);
 		return ERROR_OK;
-
-t9_err:
-		if (started) {
-			if (target->state == TARGET_RUNNING)
-				target_halt(target);
-			/* best-effort context restore; session ends with chip reset */
-			target_wait_algorithm(target, 0, NULL, 0, NULL, t9_exit, 1000, &armv7m_algo);
-		}
-		destroy_reg_param(&rp[0]);
-		destroy_reg_param(&rp[1]);
-		destroy_reg_param(&rp[2]);
-		return retval != ERROR_OK ? retval : ERROR_FLASH_OPERATION_FAILED;
 	}
 
 	/* allocate working area and variables with flash programming code */
