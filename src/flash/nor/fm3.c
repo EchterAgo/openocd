@@ -17,6 +17,10 @@
 #include <helper/binarybuffer.h>
 #include <target/algorithm.h>
 #include <target/armv7m.h>
+#include <target/register.h>
+#include <helper/time_support.h>
+#include <target/arm_adi_v5.h>
+#include <target/target_type.h>
 
 #define FLASH_DQ6 0x40		/* Data toggle flag bit (TOGG) position */
 #define FLASH_DQ5 0x20		/* Time limit exceeding flag bit (TLOV) position */
@@ -30,6 +34,9 @@ enum fm3_variant {
 	MB9BFXX6,
 	MB9BFXX7,
 	MB9BFXX8,
+	MB9BFXX9,	/* "Flash macro type 9-12" parts (e.g. MB9BF324L):
+		     * FLASH I/F has no FASZR; status via FSTR bit0,
+		     * program cmd AA/55/A0 at 0xAA8/0x554 ports. */
 
 	MB9AFXX1,	/* Flash Type '2' */
 	MB9AFXX2,
@@ -44,7 +51,8 @@ enum fm3_variant {
 enum fm3_flash_type {
 	FM3_NO_FLASH_TYPE = 0,
 	FM3_FLASH_TYPE1   = 1,
-	FM3_FLASH_TYPE2   = 2
+	FM3_FLASH_TYPE2   = 2,
+	FM3_FLASH_TYPE9   = 9
 };
 
 struct fm3_flash_bank {
@@ -112,6 +120,11 @@ FLASH_BANK_COMMAND_HANDLER(fm3_flash_bank_command)
 	} else if (strcmp(CMD_ARGV[5], "mb9afxx8.cpu") == 0) {
 		fm3_info->variant = MB9AFXX8;
 		fm3_info->flashtype = FM3_FLASH_TYPE2;
+	} else if (strcmp(CMD_ARGV[5], "mb9bfxx9.cpu") == 0) {
+		/* e.g. MB9BF324L: 512K geometry like xx6, but the newer
+		 * FICR/FISR/FSTR macro without FASZR. */
+		fm3_info->variant = MB9BFXX6;
+		fm3_info->flashtype = FM3_FLASH_TYPE9;
 	}
 
 	/* unknown Flash type */
@@ -124,6 +137,29 @@ FLASH_BANK_COMMAND_HANDLER(fm3_flash_bank_command)
 	fm3_info->probed = false;
 
 	return ERROR_OK;
+}
+
+
+/* FSTR bit0 polling via bit-band alias (flash macro type 9-12) */
+static int fm3_fstr_wait(struct target *target, int timeout_ms)
+{
+	int ms = 0;
+	uint8_t state;
+	int retval;
+
+	while (1) {
+		retval = target_read_u8(target, 0x42000100, &state);
+		if (retval != ERROR_OK)
+			return retval;
+		if (state)
+			return ERROR_OK;
+		keep_alive();
+		usleep(1000);
+		if (++ms > timeout_ms) {
+			LOG_ERROR("FSTR poll timed out after %d ms", ms);
+			return ERROR_FLASH_OPERATION_FAILED;
+		}
+	}
 }
 
 /* Data polling algorithm */
@@ -208,10 +244,39 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 
 	u32_flash_type = (uint32_t) fm3_info->flashtype;
 
+	if (u32_flash_type == FM3_FLASH_TYPE9) {
+		/* Pure host-side sequence (mirrors vendor bootloader; no on-target
+		 * algorithm because CPU fetches during erase-busy would fault). */
+		for (unsigned int sector = first; sector <= last; sector++) {
+			uint32_t sector_base = bank->base + bank->sectors[sector].offset;
+			retval = fm3_fstr_wait(target, 1500);
+			if (retval != ERROR_OK)
+				return retval;
+			/* sector erase setup */
+			retval  = target_write_u16(target, 0x00000AA8, 0x00AA);
+			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
+			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x0080);
+			/* sector erase confirm */
+			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00AA);
+			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
+			if (retval == ERROR_OK) retval = target_write_u16(target, sector_base, 0x0030);
+			if (retval != ERROR_OK) {
+				LOG_ERROR("fm3 type9 erase command fault sector %u", sector);
+				return retval;
+			}
+			retval = fm3_fstr_wait(target, 3000);
+			if (retval != ERROR_OK)
+				return retval;
+			bank->sectors[sector].is_erased = 1;
+		}
+		return ERROR_OK;
+	}
+
 	if (u32_flash_type == FM3_FLASH_TYPE1) {
 		u32_flash_seq_address1 = 0x00001550;
 		u32_flash_seq_address2 = 0x00000AA8;
-	} else if (u32_flash_type == FM3_FLASH_TYPE2) {
+	} else if (u32_flash_type == FM3_FLASH_TYPE2
+		|| u32_flash_type == FM3_FLASH_TYPE9) {
 		u32_flash_seq_address1 = 0x00000AA8;
 		u32_flash_seq_address2 = 0x00000554;
 	} else {
@@ -265,15 +330,19 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 	if (retval != ERROR_OK)
 		return retval;
 
-	/* FASZR = 0x01, Enables CPU Programming Mode (16-bit Flash access) */
-	retval = target_write_u32(target, 0x40000000, 0x0001);
-	if (retval != ERROR_OK)
-		return retval;
+	if (fm3_info->flashtype != FM3_FLASH_TYPE9) {
+		/* FASZR = 0x01, Enables CPU Programming Mode (16-bit Flash access) */
+		retval = target_write_u32(target, 0x40000000, 0x0001);
+		if (retval != ERROR_OK)
+			return retval;
+	}
 
-	/* dummy read of FASZR */
-	retval = target_read_u32(target, 0x40000000, &u32_dummy_read);
-	if (retval != ERROR_OK)
-		return retval;
+	if (fm3_info->flashtype != FM3_FLASH_TYPE9) {
+		/* dummy read of FASZR */
+		retval = target_read_u32(target, 0x40000000, &u32_dummy_read);
+		if (retval != ERROR_OK)
+			return retval;
+	}
 
 	/* allocate working area with flash sector erase code */
 	if (target_alloc_working_area(target, sizeof(fm3_flash_erase_sector_code),
@@ -297,7 +366,7 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 	for (unsigned int sector = first ; sector <= last ; sector++) {
 		uint32_t offset = bank->sectors[sector].offset;
 
-		for (odd = 0; odd < 2 ; odd++) {
+		for (odd = 0; odd < (fm3_info->flashtype == FM3_FLASH_TYPE9 ? 1 : 2) ; odd++) {
 			if (odd)
 				offset += 4;
 
@@ -313,7 +382,10 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 				return retval;
 			}
 
-			retval = fm3_busy_wait(target, offset, 500);
+			if (fm3_info->flashtype == FM3_FLASH_TYPE9)
+				retval = fm3_fstr_wait(target, 1500);
+			else
+				retval = fm3_busy_wait(target, offset, 500);
 			if (retval != ERROR_OK)
 				return retval;
 		}
@@ -324,15 +396,118 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 	destroy_reg_param(&reg_params[1]);
 	destroy_reg_param(&reg_params[2]);
 
-	/* FASZR = 0x02, Enables CPU Run Mode (32-bit Flash access) */
-	retval = target_write_u32(target, 0x40000000, 0x0002);
-	if (retval != ERROR_OK)
-		return retval;
+	if (fm3_info->flashtype != FM3_FLASH_TYPE9) {
+		/* FASZR = 0x02, Enables CPU Run Mode (32-bit Flash access) */
+		retval = target_write_u32(target, 0x40000000, 0x0002);
+		if (retval != ERROR_OK)
+			return retval;
 
-	retval = target_read_u32(target, 0x40000000, &u32_dummy_read); /* dummy read of FASZR */
+		retval = target_read_u32(target, 0x40000000, &u32_dummy_read); /* dummy read of FASZR */
+	}
 
 	return retval;
 }
+
+/* Batched word writes through the debug AP: one CSW/TAR per transfer
+ * instead of mem_ap_write_u32's re-push per word. Works with the core
+ * RUNNING (plain AHB debug accesses). len multiple of 4, both aligned. */
+static int t9_bulk_write(struct adiv5_ap *ap, uint32_t addr,
+			 const uint8_t *buf, uint32_t len)
+{
+	struct adiv5_dap *dap = ap->dap;
+	int retval = dap_queue_ap_write(ap, MEM_AP_REG_CSW(dap),
+			ap->csw_default | CSW_32BIT | CSW_ADDRINC_SINGLE);
+	if (retval == ERROR_OK)
+		retval = dap_queue_ap_write(ap, MEM_AP_REG_TAR(dap), addr);
+	for (uint32_t i = 0; retval == ERROR_OK && i < len; i += 4) {
+		uint32_t val = buf[i] | (buf[i + 1] << 8) |
+			(buf[i + 2] << 16) | ((uint32_t)buf[i + 3] << 24);
+		retval = dap_queue_ap_write(ap, MEM_AP_REG_DRW(dap), val);
+	}
+	uint32_t dummy;
+	if (retval == ERROR_OK)
+		retval = dap_queue_dp_read(dap, DP_RDBUFF, &dummy);
+	if (retval == ERROR_OK)
+		retval = dap_run(dap);
+	ap->tar_valid = false;	/* auto-inc moved TAR under the cache */
+	/* RDBUFF roundtrip flushes the queue and surfaces wire faults in
+	 * retval; content faults are caught by the final flash verify. */
+	return retval;
+}
+
+/* Type 9-12 RAM-island ring-consumer stub.
+ *
+ * Reassemble with: arm-none-eabi-as -mthumb -o t9_stub.o t9_stub.S
+ *                  arm-none-eabi-objcopy -O binary t9_stub.o t9_stub.bin
+ * (source kept verbatim below; 92 bytes, bkpt at +0x56).
+ *
+ * Must run from 0x1FFFC100, the vendor bootloader's own RAM-code
+ * island: the 0x20000000 RAM is not executable on these parts, and
+ * running from RAM block 0 faults on the flash aperture while the
+ * macro is busy.  r0 = dst flash addr, r1 = 8 KB ring base,
+ * r3 = ctrl block (u32 wr / u32 rd / u32 stop).  The loop pops one
+ * halfword from the ring and runs the vendor per-halfword program
+ * sequence (FSTR poll, AA/55/A0, strh); empty ring plus stop flag
+ * exits via bkpt.  The host refills the ring through the debug AP
+ * WHILE THIS STUB RUNS, so SWD upload overlaps macro programming.
+ *
+ * 	.syntax unified
+ * 	.thumb
+ * 	.thumb_func
+ * # r0=dst flash, r1=ring base (8KB, mask 0x1FFF), r3=ctrl block
+ * # ctrl+0 wr(bytes) ctrl+4 rd(bytes) ctrl+8 stop
+ * 	.global t9_ring
+ * t9_ring:
+ * 	cpsid i
+ * 	push {r4-r9,r12, lr}
+ * 	movw r7, #0x0100
+ * 	movt r7, #0x4200	@ FSTR bit-band alias 0x42000100
+ * 	movw r8, #0x0AA8
+ * 	movw r9, #0x0554
+ * 	movw r12, #0x1FFF
+ * loop:
+ * 	ldr r4, [r3, #0]	@ wr
+ * 	ldr r5, [r3, #4]	@ rd
+ * 	cmp r4, r5
+ * 	bne have
+ * 	ldr r2, [r3, #8]	@ stop
+ * 	cmp r2, #0
+ * 	bne done
+ * 	b loop
+ * have:
+ * waitf:
+ * 	ldrb r6, [r7]
+ * 	cmp r6, #0
+ * 	beq waitf
+ * 	movs r6, #0xAA
+ * 	strh r6, [r8]
+ * 	movs r6, #0x55
+ * 	strh r6, [r9]
+ * 	movs r6, #0xA0
+ * 	strh r6, [r8]
+ * 	mov r6, r5
+ * 	ands r6, r12
+ * 	adds r6, r1
+ * 	ldrh r4, [r6]
+ * 	strh r4, [r0]
+ * 	adds r0, #2
+ * 	adds r5, #2
+ * 	str r5, [r3, #4]
+ * 	b loop
+ * done:
+ * 	bkpt #0
+ * 	pop {r4-r9,r12, pc}
+ */
+static const uint8_t t9_stub[] = {
+	0x72, 0xb6, 0x2d, 0xe9, 0xf0, 0x53, 0x40, 0xf2, 0x00, 0x17, 0xc4, 0xf2,
+	0x00, 0x27, 0x40, 0xf6, 0xa8, 0x28, 0x40, 0xf2, 0x54, 0x59, 0x41, 0xf6,
+	0xff, 0x7c, 0x1c, 0x68, 0x5d, 0x68, 0xac, 0x42, 0x03, 0xd1, 0x9a, 0x68,
+	0x00, 0x2a, 0x16, 0xd1, 0xf7, 0xe7, 0x3e, 0x78, 0x00, 0x2e, 0xfc, 0xd0,
+	0xaa, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x55, 0x26, 0xa9, 0xf8, 0x00, 0x60,
+	0xa0, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x2e, 0x46, 0x16, 0xea, 0x0c, 0x06,
+	0x76, 0x18, 0x34, 0x88, 0x04, 0x80, 0x02, 0x30, 0x02, 0x35, 0x5d, 0x60,
+	0xe1, 0xe7, 0x00, 0xbe, 0xbd, 0xe8, 0xf0, 0x93,
+};
 
 static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		uint32_t offset, uint32_t count)
@@ -359,7 +534,8 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	if (u32_flash_type == FM3_FLASH_TYPE1) {
 		u32_flash_seq_address1 = 0x00001550;
 		u32_flash_seq_address2 = 0x00000AA8;
-	} else if (u32_flash_type == FM3_FLASH_TYPE2) {
+	} else if (u32_flash_type == FM3_FLASH_TYPE2
+		|| u32_flash_type == FM3_FLASH_TYPE9) {
 		u32_flash_seq_address1 = 0x00000AA8;
 		u32_flash_seq_address2 = 0x00000554;
 	} else {
@@ -521,6 +697,149 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	if (offset & 0x1) {
 		LOG_WARNING("offset 0x%" PRIx32 " breaks required 2-byte alignment", offset);
 		return ERROR_FLASH_DST_BREAKS_ALIGNMENT;
+	}
+
+	if (u32_flash_type == FM3_FLASH_TYPE9) {
+		/* Pipelined ring program: the on-chip stub consumes an 8 KB ring
+		 * while we refill it through the debug AP with the core RUNNING.
+		 * Overrun is impossible (refill gated on the live rd pointer);
+		 * starvation is rate-impossible (SWD >> ~91 KB/s macro drain). */
+		struct armv7m_algorithm armv7m_algo;
+		struct reg_param rp[3];
+		struct adiv5_ap *dap = target_to_armv7m(target)->debug_ap;
+		const uint32_t t9_code = 0x1FFFC100;
+		const uint32_t t9_ctrl = 0x1FFFC400;
+		const uint32_t t9_ring = 0x1FFFC800;
+		const uint32_t t9_size = 8192;
+		const uint32_t t9_exit = t9_code + 0x56;
+		const uint32_t total = count & ~3u;	/* whole words via ring */
+		uint32_t wr = 0, rd = 0;
+		int64_t t_start;
+		bool started = false;
+
+		memset(&armv7m_algo, 0, sizeof(armv7m_algo));
+		armv7m_algo.common_magic = ARMV7M_COMMON_MAGIC;
+		armv7m_algo.core_mode = ARM_MODE_THREAD;
+
+		static const uint8_t zeros[12];	/* ctrl: wr rd stop */
+		retval = target_write_buffer(target, t9_ctrl, sizeof(zeros), zeros);
+		if (retval == ERROR_OK)
+			retval = target_write_buffer(target, t9_code, sizeof(t9_stub), t9_stub);
+		if (retval == ERROR_OK && total > 0) {
+			wr = total < t9_size ? total : t9_size;
+			retval = target_write_buffer(target, t9_ring, wr, buffer);
+		}
+		if (retval == ERROR_OK)
+			retval = target_write_u32(target, t9_ctrl, wr);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: pipeline preload failed");
+			return retval;
+		}
+
+		init_reg_param(&rp[0], "r0", 32, PARAM_OUT);
+		init_reg_param(&rp[1], "r1", 32, PARAM_OUT);
+		init_reg_param(&rp[2], "r3", 32, PARAM_OUT);
+		buf_set_u32(rp[0].value, 0, 32, address);
+		buf_set_u32(rp[1].value, 0, 32, t9_ring);
+		buf_set_u32(rp[2].value, 0, 32, t9_ctrl);
+
+		retval = target_start_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
+						t9_code | 1, t9_exit, &armv7m_algo);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: pipeline stub start failed");
+			goto t9_err;
+		}
+		started = true;
+
+		t_start = timeval_ms();
+		while (wr < total) {
+			retval = mem_ap_read_atomic_u32(dap, t9_ctrl + 4, &rd);
+			if (retval != ERROR_OK)
+				goto t9_err;
+			if (wr - rd > t9_size - 2048) {
+				/* ring near full; consumer should drain 2 KB
+				 * in ~45 ms -- much faster than one refill poll */
+				target_poll(target);
+				if (target->state == TARGET_HALTED) {
+					LOG_ERROR("fm3 type9: stub exited early (rd=%" PRIu32
+						  " of %" PRIu32 ")", rd, wr);
+					retval = ERROR_FLASH_OPERATION_FAILED;
+					goto t9_err;
+				}
+				if (timeval_ms() - t_start > 60000) {
+					LOG_ERROR("fm3 type9: pipeline stalled");
+					target_halt(target);
+					retval = ERROR_FLASH_OPERATION_FAILED;
+					goto t9_err;
+				}
+				keep_alive();
+				continue;
+			}
+			uint32_t slot = wr & (t9_size - 1);
+			uint32_t seg = 2048;
+			if (slot + seg > t9_size)
+				seg = t9_size - slot;
+			if (seg > total - wr)
+				seg = total - wr;
+			seg &= ~3u;
+			if (seg == 0)
+				seg = 4;	/* single word across wrap */
+			retval = t9_bulk_write(dap, t9_ring + slot, buffer + wr, seg);
+			if (retval != ERROR_OK)
+				goto t9_err;
+			wr += seg;
+			retval = mem_ap_write_atomic_u32(dap, t9_ctrl, wr);
+			if (retval != ERROR_OK)
+				goto t9_err;
+		}
+
+		{
+			uint32_t one = 1;
+			retval = mem_ap_write_atomic_u32(dap, t9_ctrl + 8, one);
+			if (retval != ERROR_OK)
+				goto t9_err;
+		}
+		retval = target_wait_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
+					     t9_exit, 30000, &armv7m_algo);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: ring stub did not complete cleanly");
+			started = false;
+			goto t9_err;
+		}
+		started = false;
+		destroy_reg_param(&rp[0]);
+		destroy_reg_param(&rp[1]);
+		destroy_reg_param(&rp[2]);
+
+		/* program any remaining 2-byte halfword directly (host side) */
+		for (uint32_t off = total; off < count; off += 2) {
+			uint16_t val = buffer[off] | (buffer[off + 1] << 8);
+			retval = fm3_fstr_wait(target, 500);
+			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00AA);
+			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
+			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00A0);
+			if (retval == ERROR_OK) retval = target_write_u16(target, address + off, val);
+			if (retval != ERROR_OK) {
+				LOG_ERROR("fm3 type9: tail halfword failed");
+				return retval;
+			}
+			retval = fm3_fstr_wait(target, 1000);
+			if (retval != ERROR_OK)
+				return retval;
+		}
+		return ERROR_OK;
+
+t9_err:
+		if (started) {
+			if (target->state == TARGET_RUNNING)
+				target_halt(target);
+			/* best-effort context restore; session ends with chip reset */
+			target_wait_algorithm(target, 0, NULL, 0, NULL, t9_exit, 1000, &armv7m_algo);
+		}
+		destroy_reg_param(&rp[0]);
+		destroy_reg_param(&rp[1]);
+		destroy_reg_param(&rp[2]);
+		return retval != ERROR_OK ? retval : ERROR_FLASH_OPERATION_FAILED;
 	}
 
 	/* allocate working area and variables with flash programming code */
@@ -819,7 +1138,8 @@ static int fm3_chip_erase(struct flash_bank *bank)
 		LOG_INFO("*** Erasing mb9bfxxx type");
 		u32_flash_seq_address1 = 0x00001550;
 		u32_flash_seq_address2 = 0x00000AA8;
-	} else if (u32_flash_type == FM3_FLASH_TYPE2) {
+	} else if (u32_flash_type == FM3_FLASH_TYPE2
+		|| u32_flash_type == FM3_FLASH_TYPE9) {
 		LOG_INFO("*** Erasing mb9afxxx type");
 		u32_flash_seq_address1 = 0x00000AA8;
 		u32_flash_seq_address2 = 0x00000554;
@@ -873,15 +1193,19 @@ static int fm3_chip_erase(struct flash_bank *bank)
 	if (retval != ERROR_OK)
 		return retval;
 
-	/* FASZR = 0x01, Enables CPU Programming Mode (16-bit Flash access) */
-	retval = target_write_u32(target, 0x40000000, 0x0001);
-	if (retval != ERROR_OK)
-		return retval;
+	if (fm3_info2->flashtype != FM3_FLASH_TYPE9) {
+		/* FASZR = 0x01, Enables CPU Programming Mode (16-bit Flash access) */
+		retval = target_write_u32(target, 0x40000000, 0x0001);
+		if (retval != ERROR_OK)
+			return retval;
+	}
 
-	/* dummy read of FASZR */
-	retval = target_read_u32(target, 0x40000000, &u32_dummy_read);
-	if (retval != ERROR_OK)
-		return retval;
+	if (fm3_info2->flashtype != FM3_FLASH_TYPE9) {
+		/* dummy read of FASZR */
+		retval = target_read_u32(target, 0x40000000, &u32_dummy_read);
+		if (retval != ERROR_OK)
+			return retval;
+	}
 
 	/* allocate working area with flash chip erase code */
 	if (target_alloc_working_area(target, sizeof(fm3_flash_erase_chip_code),
@@ -971,6 +1295,13 @@ static const struct command_registration fm3_command_handlers[] = {
 	COMMAND_REGISTRATION_DONE
 };
 
+/* flash verify_bank / read path: code flash is memory mapped */
+static int fm3_read(struct flash_bank *bank, uint8_t *buffer,
+		    uint32_t offset, uint32_t count)
+{
+	return target_read_buffer(bank->target, bank->base + offset, count, buffer);
+}
+
 const struct flash_driver fm3_flash = {
 	.name = "fm3",
 	.commands = fm3_command_handlers,
@@ -980,5 +1311,6 @@ const struct flash_driver fm3_flash = {
 	.probe = fm3_probe,
 	.auto_probe = fm3_auto_probe,
 	.erase_check = default_flash_blank_check,
+	.read = fm3_read,
 	.free_driver_priv = default_flash_free_driver_priv,
 };
