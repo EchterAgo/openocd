@@ -61,6 +61,8 @@ struct fm3_flash_bank {
 	bool probed;
 };
 
+static int fm3_type9_reset(struct target *target);
+
 FLASH_BANK_COMMAND_HANDLER(fm3_flash_bank_command)
 {
 	struct fm3_flash_bank *fm3_info;
@@ -121,8 +123,8 @@ FLASH_BANK_COMMAND_HANDLER(fm3_flash_bank_command)
 		fm3_info->variant = MB9AFXX8;
 		fm3_info->flashtype = FM3_FLASH_TYPE2;
 	} else if (strcmp(CMD_ARGV[5], "mb9bfxx9.cpu") == 0) {
-		/* e.g. MB9BF324L: 512K geometry like xx6, but the newer
-		 * FICR/FISR/FSTR macro without FASZR. */
+		/* e.g. MB9BF324L: newer FICR/FISR/FSTR macro without FASZR;
+		 * geometry overridden for the real TYPE9 SA layout below. */
 		fm3_info->variant = MB9BFXX6;
 		fm3_info->flashtype = FM3_FLASH_TYPE9;
 	}
@@ -245,8 +247,10 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 	u32_flash_type = (uint32_t) fm3_info->flashtype;
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
-		/* Pure host-side sequence (mirrors vendor bootloader; no on-target
-		 * algorithm because CPU fetches during erase-busy would fault). */
+		/* Pure host-side sequence (mirrors vendor bootloader). */
+		retval = fm3_type9_reset(target);
+		if (retval != ERROR_OK)
+			return retval;
 		for (unsigned int sector = first; sector <= last; sector++) {
 			uint32_t sector_base = bank->base + bank->sectors[sector].offset;
 			retval = fm3_fstr_wait(target, 1500);
@@ -432,6 +436,21 @@ static int t9_bulk_write(struct adiv5_ap *ap, uint32_t addr,
 	ap->tar_valid = false;	/* auto-inc moved TAR under the cache */
 	/* RDBUFF roundtrip flushes the queue and surfaces wire faults in
 	 * retval; content faults are caught by the final flash verify. */
+	return retval;
+}
+
+/* Reset macro command FSM + sticky flags: a connect-halt may have caught
+ * the core between the AA/55 unlock writes, leaving the macro armed and
+ * first stub/AP command then errors (FSTR never ready). */
+static int fm3_type9_reset(struct target *target)
+{
+	/* clear sticky macro error flags only; undefined commands on this
+	 * macro generation latch FCUFE and wedge the sequencer, so there is
+	 * no software "read reset" here — an INITX/power cycle is the
+	 * recovery for a stuck command FSM. */
+	int retval = target_write_u16(target, 0x40000028, 0xFFFF); /* FICLR: W1C all */
+	if (retval == ERROR_OK)
+		retval = fm3_fstr_wait(target, 1000);
 	return retval;
 }
 
@@ -700,6 +719,11 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	}
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
+		retval = fm3_type9_reset(target);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: macro reset failed");
+			return retval;
+		}
 		/* Pipelined ring program: the on-chip stub consumes an 8 KB ring
 		 * while we refill it through the debug AP with the core RUNNING.
 		 * Overrun is impossible (refill gated on the live rd pointer);
@@ -757,8 +781,7 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 			if (retval != ERROR_OK)
 				goto t9_err;
 			if (wr - rd > t9_size - 2048) {
-				/* ring near full; consumer should drain 2 KB
-				 * in ~45 ms -- much faster than one refill poll */
+				/* ring near full; occupancy of monotonic counters */
 				target_poll(target);
 				if (target->state == TARGET_HALTED) {
 					LOG_ERROR("fm3 type9: stub exited early (rd=%" PRIu32
@@ -767,7 +790,11 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 					goto t9_err;
 				}
 				if (timeval_ms() - t_start > 60000) {
-					LOG_ERROR("fm3 type9: pipeline stalled");
+					uint32_t fisr = 0, fstr = 0;
+					target_read_u32(target, 0x40000024, &fisr);
+					target_read_u32(target, 0x40000008, &fstr);
+					LOG_ERROR("fm3 type9: pipeline stalled (wr=%" PRIu32 " rd=%" PRIu32
+						  " FSTR=%08" PRIx32 " FISR=%08" PRIx32 ")", wr, rd, fstr, fisr);
 					target_halt(target);
 					retval = ERROR_FLASH_OPERATION_FAILED;
 					goto t9_err;
@@ -827,6 +854,10 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 			if (retval != ERROR_OK)
 				return retval;
 		}
+		/* The island RAM we occupied may have been the app's live
+		 * vectors/code; never leave the core running after this. */
+		target_halt(target);
+		target_write_u32(target, 0xE000ED0C, 0x05FA0004);
 		return ERROR_OK;
 
 t9_err:
@@ -1102,6 +1133,50 @@ static int fm3_probe(struct flash_bank *bank)
 		bank->sectors[9].size = 128 * 1024;
 		bank->sectors[9].is_erased = -1;
 		bank->sectors[9].is_protected = -1;
+	}
+
+	if (fm3_info->flashtype == FM3_FLASH_TYPE9) {
+		/* Real TYPE9 erase-unit map (MB9B320M datasheet 002-05652,
+		 * memory map 2): main area = 256K as
+		 *   SA2 8K @0x00000, SA3 8K @0x02000, SA8 48K @0x04000,
+		 *   SA9 64K @0x10000, SA10 64K @0x20000, SA11 64K @0x30000.
+		 * Reads above 0x40000 alias the main area; the 32K "work
+		 * area" lives at 0x200000+ behind its own aperture and is
+		 * not part of this bank. */
+		bank->size = 256 * 1024;
+		bank->num_sectors = 6;
+		bank->sectors[0].offset = 0x00000;	bank->sectors[0].size =  8 * 1024;
+		bank->sectors[1].offset = 0x02000;	bank->sectors[1].size =  8 * 1024;
+		bank->sectors[2].offset = 0x04000;	bank->sectors[2].size = 48 * 1024;
+		bank->sectors[3].offset = 0x10000;	bank->sectors[3].size = 64 * 1024;
+		bank->sectors[4].offset = 0x20000;	bank->sectors[4].size = 64 * 1024;
+		bank->sectors[5].offset = 0x30000;	bank->sectors[5].size = 64 * 1024;
+		for (unsigned int i = 0; i < 6; i++) {
+			bank->sectors[i].is_erased = -1;
+			bank->sectors[i].is_protected = 0;
+		}
+	}
+
+	if (fm3_info->flashtype == FM3_FLASH_TYPE9) {
+		/* Real TYPE9 erase-unit map (MB9B320M datasheet 002-05652,
+		 * memory map 2): main area = 256K as
+		 *   SA2 8K @0x00000, SA3 8K @0x02000, SA8 48K @0x04000,
+		 *   SA9 64K @0x10000, SA10 64K @0x20000, SA11 64K @0x30000.
+		 * Reads above 0x40000 alias the main area; the 32K "work
+		 * area" lives at 0x200000+ behind its own aperture and is
+		 * not part of this bank. */
+		bank->size = 256 * 1024;
+		bank->num_sectors = 6;
+		bank->sectors[0].offset = 0x00000;	bank->sectors[0].size =  8 * 1024;
+		bank->sectors[1].offset = 0x02000;	bank->sectors[1].size =  8 * 1024;
+		bank->sectors[2].offset = 0x04000;	bank->sectors[2].size = 48 * 1024;
+		bank->sectors[3].offset = 0x10000;	bank->sectors[3].size = 64 * 1024;
+		bank->sectors[4].offset = 0x20000;	bank->sectors[4].size = 64 * 1024;
+		bank->sectors[5].offset = 0x30000;	bank->sectors[5].size = 64 * 1024;
+		for (unsigned int i = 0; i < 6; i++) {
+			bank->sectors[i].is_erased = -1;
+			bank->sectors[i].is_protected = 0;
+		}
 	}
 
 	fm3_info->probed = true;
