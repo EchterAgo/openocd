@@ -248,6 +248,10 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
 		/* Pure host-side sequence (mirrors vendor bootloader). */
+		if (target->state != TARGET_HALTED) {
+			LOG_ERROR("fm3 type9: target not halted for erase");
+			return ERROR_FAIL;
+		}
 		retval = fm3_type9_reset(target);
 		if (retval != ERROR_OK)
 			return retval;
@@ -688,8 +692,6 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	if (retval != ERROR_OK)
 		return retval;
 
-	count = count / 2;		/* number bytes -> number halfwords */
-
 	/* check code alignment */
 	if (offset & 0x1) {
 		LOG_WARNING("offset 0x%" PRIx32 " breaks required 2-byte alignment", offset);
@@ -697,6 +699,33 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	}
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
+		uint32_t dhcsr;
+		LOG_INFO("t9 write_block: addr=%08x count=%u", address, count);
+
+		/* Preflight: S_HALT must be set and the macro must answer. A
+		 * half-erased BL leaves the core in a fault storm and the
+		 * macro wedged; bail with an explicit diagnosis instead of
+		 * cascading AP errors. */
+		if (target->state != TARGET_HALTED) {
+			LOG_ERROR("fm3 type9: target not halted (state %d)",
+				  target->state);
+			return ERROR_FAIL;
+		}
+		retval = target_read_u32(target, 0xE000EDF0, &dhcsr);
+		if (retval != ERROR_OK || !(dhcsr & (1u << 16))) {
+			LOG_ERROR("fm3 type9: cannot confirm halt (dhcsr %08" PRIx32 ")",
+				  dhcsr);
+			return ERROR_FAIL;
+		}
+		uint32_t fstr;
+		retval = target_read_u8(target, 0x42000100, (uint8_t *)&fstr);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: flash macro unresponsive (FSTR read "
+				  "failed) — chip likely in fault storm from damaged "
+				  "bootloader; power-cycle required");
+			return ERROR_FAIL;
+		}
+
 		retval = fm3_type9_reset(target);
 		if (retval != ERROR_OK)
 			return retval;
@@ -712,10 +741,12 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		armv7m_algo.common_magic = ARMV7M_COMMON_MAGIC;
 		armv7m_algo.core_mode = ARM_MODE_THREAD;
 
-		for (uint32_t done = 0; done < count; ) {
+		uint32_t done = 0;
+		while (done < count) {
 			uint32_t chunk = count - done;
 			if (chunk > 16384)
 				chunk = 16384;
+
 
 			retval = target_write_buffer(target, t9_data, chunk, buffer + done);
 			if (retval == ERROR_OK)
@@ -731,7 +762,7 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 			init_reg_param(&rp[2], "r2", 32, PARAM_OUT);
 			buf_set_u32(rp[0].value, 0, 32, address + done);
 			buf_set_u32(rp[1].value, 0, 32, t9_data);
-			buf_set_u32(rp[2].value, 0, 32, chunk / 2);
+			buf_set_u32(rp[2].value, 0, 32, chunk / 2);	/* r2 counts halfwords */
 
 			retval = target_run_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
 							  t9_code | 1, t9_code + 0x30,
@@ -746,14 +777,30 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 					  address + done);
 				return retval;
 			}
+			{
+				uint32_t fisr = 0, fstr = 0, dhcsr = 0;
+				target_read_u32(target, 0x40000004, &fisr);
+				target_read_u8(target, 0x42000100, (uint8_t *)&fstr);
+				target_read_u32(target, 0xE000EDF0, &dhcsr);
+				LOG_INFO("t9 chunk @%08" PRIx32 " FISR=%08x FSTR=%02x DHCSR=%08x",
+					 address + done, fisr, fstr, dhcsr);
+			}
 			done += chunk;
+			LOG_INFO("t9 loop: done=%u of %u", done, count);
 			keep_alive();
 		}
+		if (done != count)
+			LOG_ERROR("t9: incomplete write %u of %u", done, count);
 
-		/* never resume into the trashed RAM island */
-		target_write_u32(target, 0xE000ED0C, 0x05FA0004);
+		/* Stay halted: verify_bank must run before the app boots and
+		 * rewrites its config page; caller issues the AIRCR reset. */
+		target_halt(target);
 		return ERROR_OK;
 	}
+
+	/* legacy FM3 algorithms count halfwords */
+	count = count / 2;
+
 
 	/* allocate working area and variables with flash programming code */
 	if (target_alloc_working_area(target, sizeof(fm3_flash_write_code) + 8,
