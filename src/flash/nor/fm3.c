@@ -20,6 +20,7 @@
 #include <target/register.h>
 #include <helper/time_support.h>
 #include <target/arm_adi_v5.h>
+#include <target/cortex_m.h>
 #include <target/target_type.h>
 
 #define FLASH_DQ6 0x40		/* Data toggle flag bit (TOGG) position */
@@ -446,6 +447,42 @@ static int t9_bulk_write(struct adiv5_ap *ap, uint32_t addr,
 /* Reset macro command FSM + sticky flags: a connect-halt may have caught
  * the core between the AA/55 unlock writes, leaving the macro armed and
  * first stub/AP command then errors (FSTR never ready). */
+/* Arm a throwaway vector table + wipe pending IRQs right before a stub
+ * handoff. A halted-but-still-connected USB peripheral keeps setting
+ * NVIC pendings; on resume they vector through the app table at the
+ * trashed island -> wild code -> it REWRITES flash under our feet.
+ * Every entry points at an immediate bkpt inside our own footprint,
+ * so a stray exception halts cleanly where the producer can see it. */
+
+static int fm3_type9_arm_vectors(struct target *target, uint32_t wabase)
+{
+	struct adiv5_ap *dap = target_to_armv7m(target)->debug_ap;
+	uint8_t vtab[128 * 4];
+	uint32_t h = (wabase + 128 * 4) | 1u;	/* handler = bkpt after table */
+	uint32_t sp = wabase + 128 * 4 + 0x100;
+	for (unsigned int v = 0; v < 128; v++) {
+		vtab[v * 4 + 0] = (v ? h : sp) & 0xff;
+		vtab[v * 4 + 1] = ((v ? h : sp) >> 8) & 0xff;
+		vtab[v * 4 + 2] = ((v ? h : sp) >> 16) & 0xff;
+		vtab[v * 4 + 3] = ((v ? h : sp) >> 24) & 0xff;
+	}
+	int retval = target_write_buffer(target, wabase, sizeof(vtab), vtab);
+	if (retval == ERROR_OK)
+		retval = target_write_u16(target, wabase + 128 * 4, 0xbe01);
+	if (retval == ERROR_OK)
+		retval = mem_ap_write_atomic_u32(dap, 0xE000ED08 /* VTOR */, wabase);
+	if (retval == ERROR_OK) {
+		mem_ap_write_atomic_u32(dap, 0xE000E100, 0xFFFFFFFF);	/* ICER0 */
+		mem_ap_write_atomic_u32(dap, 0xE000E180, 0xFFFFFFFF);	/* ICER1 */
+		mem_ap_write_atomic_u32(dap, 0xE000E300, 0xFFFFFFFF);	/* ICPR0 */
+		mem_ap_write_atomic_u32(dap, 0xE000E380, 0xFFFFFFFF);	/* ICPR1 */
+		mem_ap_write_atomic_u32(dap, 0xE000EF00, 0xFFFFFFFF);	/* ICABR0 */
+		mem_ap_write_atomic_u32(dap, 0xE000E280, 0xFFFFFFFF);	/* ICABR? */
+	}
+	return retval;
+}
+
+
 static int fm3_type9_reset(struct target *target)
 {
 	/* clear sticky macro error flags only; undefined commands on this
@@ -764,7 +801,9 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 			buf_set_u32(rp[1].value, 0, 32, t9_data);
 			buf_set_u32(rp[2].value, 0, 32, chunk / 2);	/* r2 counts halfwords */
 
-			retval = target_run_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
+			retval = fm3_type9_arm_vectors(target, t9_code + 0x80);
+			if (retval == ERROR_OK)
+				retval = target_run_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
 							  t9_code | 1, t9_code + 0x30,
 							  30000, &armv7m_algo);
 
@@ -1318,3 +1357,4 @@ const struct flash_driver fm3_flash = {
 	.read = fm3_read,
 	.free_driver_priv = default_flash_free_driver_priv,
 };
+
