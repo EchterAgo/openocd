@@ -818,6 +818,7 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		const uint32_t t9_exit = t9_code + 0x56;
 		const uint32_t total = count & ~3u;	/* whole words via ring */
 		uint32_t wr = 0, rd = 0, rd_seen = 0xFFFFFFFF;
+		unsigned int rescues = 0;
 		int64_t t_noprog = timeval_ms();
 		int64_t t_start;
 		bool started = false;
@@ -934,8 +935,54 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 						retval = ERROR_FLASH_OPERATION_FAILED;
 						goto t9_err;
 					}
-					if (!(dhcsr & (1u << 16))) {
-						/* still running: keep waiting */
+					if (rescues < 2) {
+						/* Zero progress: handoff silently
+						 * NAcked or core bounced to stale
+						 * sleep. Re-run the
+						 * proven manual launch: halt, set
+						 * {pc,msp,r0,r1,r3,xPSR} via DCRSR
+						 * with REGRDY verify, unmask-resume. */
+						rescues++;
+						uint32_t d;
+						fm3_type9_reset(target);	/* macro settle */
+						mem_ap_write_atomic_u32(dap, 0xE000EDF0,
+							0xA05F0003);
+						const uint32_t idx[6] = { 16, 15, 13, 0, 1, 3 };
+						const uint32_t val[6] = { 0x01000000,
+							t9_code | 1u, 0x1FF80000u + 1024u,
+							address, t9_ring, t9_ctrl };
+						for (unsigned rq = 0; rq < 6; rq++) {
+							for (unsigned att = 0; att < 4; att++) {
+								uint32_t back = ~val[rq];
+								mem_ap_write_atomic_u32(dap,
+									0xE000EDF0, 0xA05F0000 | idx[rq]);
+								mem_ap_write_atomic_u32(dap,
+									0xE000EDF4, val[rq]);
+								mem_ap_write_atomic_u32(dap, 0xE000EDF0,
+									0xA05F0000 | (1u << 16) | idx[rq]);
+								for (unsigned pp = 0; pp < 40; pp++) {
+									if (mem_ap_read_atomic_u32(dap,
+										0xE000EDF0, &d) == ERROR_OK &&
+									    (d & 1u)) {
+										back = d >> 16;
+										mem_ap_read_atomic_u32(dap,
+											0xE000EDF4, &back);
+										break;
+									}
+								}
+								if (back == val[rq] ||
+								    (idx[rq] == 16 &&
+								     (back & ~0x01000000u) ==
+								     (val[rq] & ~0x01000000u)))
+									break;
+								LOG_INFO("t9 rescue: reg%u write %u verify fail (%08x)",
+									 idx[rq], att, back);
+							}
+						}
+						mem_ap_write_atomic_u32(dap, 0xE000EDF0,
+							0xA05F0002);
+						t_noprog = timeval_ms();
+						continue;
 					} else {
 						uint32_t macro_fstr = 0xDEAD, macro_fisr = 0xDEAD;
 						mem_ap_read_atomic_u32(dap, 0x40000008, &macro_fstr);
@@ -990,11 +1037,24 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 					}
 				}
 				if (timeval_ms() - t_start > 60000) {
-					uint32_t fisr = 0, fstr = 0;
+					uint32_t fisr = 0, fstr = 0, dh2 = 0, pcv = 0;
 					target_read_u32(target, 0x40000024, &fisr);
 					target_read_u32(target, 0x40000008, &fstr);
+					mem_ap_write_atomic_u32(dap, 0xE000EDF0,
+						0xA05F0003);	/* halt to inspect */
+					mem_ap_write_atomic_u32(dap, 0xE000EDF0,
+						0xA05F0000 | (1u << 16) | 15);
+					for (unsigned pp = 0; pp < 40; pp++) {
+						if (mem_ap_read_atomic_u32(dap, 0xE000EDF0,
+						    &dh2) == ERROR_OK && (dh2 & 1u)) {
+							mem_ap_read_atomic_u32(dap, 0xE000EDF4,
+								&pcv);
+							break;
+						}
+					}
 					LOG_ERROR("fm3 type9: pipeline stalled (wr=%" PRIu32 " rd=%" PRIu32
-						  " FSTR=%08" PRIx32 " FISR=%08" PRIx32 ")", wr, rd, fstr, fisr);
+						  " FSTR=%08" PRIx32 " FISR=%08" PRIx32 " PC=%08x DHCSR=%08x)",
+						  wr, rd, fstr, fisr, pcv, dh2);
 					target_halt(target);
 					retval = ERROR_FLASH_OPERATION_FAILED;
 					goto t9_err;
