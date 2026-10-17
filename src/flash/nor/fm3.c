@@ -232,10 +232,47 @@ static int fm3_busy_wait(struct target *target, uint32_t offset, int timeout_ms)
 /* Drive a locked-up/halted FM3 core into a CLEAN debug halt.
  * DHCSR bits: 16 S_HALT, 18 S_LOCKUP. DCRSR register access is
  * dead during lockup; BIT(7)(7) exits it. */
+/* Arm a throwaway vector table + wipe pending IRQs right before a stub
+ * handoff. A halted-but-still-connected USB peripheral keeps setting
+ * NVIC pendings; on resume they vector through the app table at the
+ * trashed island -> wild code -> it REWRITES flash under our feet.
+ * Every entry points at an immediate bkpt inside our own footprint,
+ * so a stray exception halts cleanly where the producer can see it. */
+static int fm3_type9_arm_vectors(struct target *target, uint32_t wabase)
+{
+	struct adiv5_ap *dap = target_to_armv7m(target)->debug_ap;
+	uint8_t vtab[128 * 4];
+	uint32_t h = (wabase + 128 * 4) | 1u;	/* handler = bkpt after table */
+	uint32_t sp = wabase + 128 * 4 + 0x100;
+	for (unsigned int v = 0; v < 128; v++) {
+		vtab[v * 4 + 0] = (v ? h : sp) & 0xff;
+		vtab[v * 4 + 1] = ((v ? h : sp) >> 8) & 0xff;
+		vtab[v * 4 + 2] = ((v ? h : sp) >> 16) & 0xff;
+		vtab[v * 4 + 3] = ((v ? h : sp) >> 24) & 0xff;
+	}
+	int retval = target_write_buffer(target, wabase, sizeof(vtab), vtab);
+	if (retval == ERROR_OK)
+		retval = target_write_u16(target, wabase + 128 * 4, 0xbe01);
+	if (retval == ERROR_OK)
+		retval = mem_ap_write_atomic_u32(dap, 0xE000ED08 /* VTOR */, wabase);
+	if (retval == ERROR_OK) {
+		mem_ap_write_atomic_u32(dap, 0xE000E100, 0xFFFFFFFF);	/* ICER0 */
+		mem_ap_write_atomic_u32(dap, 0xE000E180, 0xFFFFFFFF);	/* ICER1 */
+		mem_ap_write_atomic_u32(dap, 0xE000E300, 0xFFFFFFFF);	/* ICPR0 */
+		mem_ap_write_atomic_u32(dap, 0xE000E380, 0xFFFFFFFF);	/* ICPR1 */
+		mem_ap_write_atomic_u32(dap, 0xE000EF00, 0xFFFFFFFF);	/* ICABR0 */
+		mem_ap_write_atomic_u32(dap, 0xE000E280, 0xFFFFFFFF);	/* ICABR? */
+	}
+	return retval;
+}
+
 static int fm3_type9_force_halt(struct target *target)
 {
 	struct adiv5_ap *dap = target_to_armv7m(target)->debug_ap;
 	unsigned int clean = 0;
+	/* trap early vector fetches so a reset-window core can never run */
+	mem_ap_write_atomic_u32(dap, DCB_DEMCR,
+		DBGKEY | TRCENA | VC_HARDERR | VC_BUSERR | VC_CORERESET);
 	for (unsigned int i = 0; i < 400; i++) {
 		uint32_t dhcsr;
 		keep_alive();
@@ -816,9 +853,18 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		const uint32_t t9_ring = 0x1FFFC800;
 		const uint32_t t9_size = 8192;
 		const uint32_t t9_exit = t9_code + 0x56;
-		const uint32_t total = count & ~3u;	/* whole words via ring */
+		uint32_t total = count & ~3u;	/* whole words via ring */
+		uint32_t base_addr = address, base_done = 0;
+		const uint8_t *base_buf = buffer;
+		unsigned int cp_restarts = 0;
 		uint32_t wr = 0, rd = 0, rd_seen = 0xFFFFFFFF;
 		unsigned int rescues = 0;
+t9_producer_start:
+		wr = 0; rd = 0; rd_seen = 0xFFFFFFFF; rescues = 0;
+		address = base_addr + base_done;
+		buffer = base_buf + base_done;
+		total = (count - base_done) & ~3u;
+		(void)wr; (void)rd;
 		int64_t t_noprog = timeval_ms();
 		int64_t t_start;
 		bool started = false;
@@ -901,6 +947,11 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 			retval = ERROR_FAIL;
 			goto t9_err;
 		}
+		retval = fm3_type9_arm_vectors(target, t9_code + 0x80);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: vector arm failed");
+			goto t9_err;
+		}
 		retval = target_start_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
 						t9_code | 1, t9_exit, &armv7m_algo);
 		if (retval != ERROR_OK) {
@@ -935,55 +986,33 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 						retval = ERROR_FLASH_OPERATION_FAILED;
 						goto t9_err;
 					}
-					if (rescues < 2) {
-						/* Zero progress: handoff silently
-						 * NAcked or core bounced to stale
-						 * sleep. Re-run the
-						 * proven manual launch: halt, set
-						 * {pc,msp,r0,r1,r3,xPSR} via DCRSR
-						 * with REGRDY verify, unmask-resume. */
-						rescues++;
-						uint32_t d;
-						fm3_type9_reset(target);	/* macro settle */
-						mem_ap_write_atomic_u32(dap, 0xE000EDF0,
-							0xA05F0003);
-						const uint32_t idx[6] = { 16, 15, 13, 0, 1, 3 };
-						const uint32_t val[6] = { 0x01000000,
-							t9_code | 1u, 0x1FF80000u + 1024u,
-							address, t9_ring, t9_ctrl };
-						for (unsigned rq = 0; rq < 6; rq++) {
-							for (unsigned att = 0; att < 4; att++) {
-								uint32_t back = ~val[rq];
-								mem_ap_write_atomic_u32(dap,
-									0xE000EDF0, 0xA05F0000 | idx[rq]);
-								mem_ap_write_atomic_u32(dap,
-									0xE000EDF4, val[rq]);
-								mem_ap_write_atomic_u32(dap, 0xE000EDF0,
-									0xA05F0000 | (1u << 16) | idx[rq]);
-								for (unsigned pp = 0; pp < 40; pp++) {
-									if (mem_ap_read_atomic_u32(dap,
-										0xE000EDF0, &d) == ERROR_OK &&
-									    (d & 1u)) {
-										back = d >> 16;
-										mem_ap_read_atomic_u32(dap,
-											0xE000EDF4, &back);
-										break;
-									}
-								}
-								if (back == val[rq] ||
-								    (idx[rq] == 16 &&
-								     (back & ~0x01000000u) ==
-								     (val[rq] & ~0x01000000u)))
-									break;
-								LOG_INFO("t9 rescue: reg%u write %u verify fail (%08x)",
-									 idx[rq], att, back);
-							}
-						}
-						mem_ap_write_atomic_u32(dap, 0xE000EDF0,
-							0xA05F0002);
-						t_noprog = timeval_ms();
-						continue;
-					} else {
+if (!(dhcsr & S_HALT)) {
+	/* alive but slow: keep waiting */
+	continue;
+}
+if (cp_restarts < 2) {
+					/* Checkpoint restart: rd is the exact
+					 * byte offset the consumer finished
+					 * programming; re-running from there
+					 * only re-programs FF cells. Tear the
+					 * algorithm down and relaunch. */
+					cp_restarts++;
+					LOG_INFO("t9 checkpoint restart at +%u (attempt %u)",
+						 rd, cp_restarts);
+					base_done += rd;
+					if (started) {
+						mem_ap_write_atomic_u32(dap, DCB_DHCSR,
+							 DBGKEY | C_HALT | C_DEBUGEN);
+						target_wait_algorithm(target, 0, NULL, 0,
+								  NULL, t9_exit, 1000,
+								  &armv7m_algo);
+						started = false;
+					}
+					rescues = 0;
+					rd_seen = 0xFFFFFFFF;
+					t_start = timeval_ms();
+					goto t9_producer_start;
+				} else {
 						uint32_t macro_fstr = 0xDEAD, macro_fisr = 0xDEAD;
 						mem_ap_read_atomic_u32(dap, 0x40000008, &macro_fstr);
 						mem_ap_read_atomic_u32(dap, 0x40000024, &macro_fisr);
@@ -1094,6 +1123,7 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 			goto t9_err;
 		}
 		started = false;
+		base_done = count;
 		destroy_reg_param(&rp[0]);
 		destroy_reg_param(&rp[1]);
 		destroy_reg_param(&rp[2]);
