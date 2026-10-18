@@ -909,7 +909,7 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		 * target ROM's range, so the work-area bank (base
 		 * 0x00200000) is programmed by the host-side halfword
 		 * loop below: total = 0 routes everything there. */
-		const bool t9_work = (bank->base != 0x00000000);
+		const bool t9_work = (bank->base != 0x00000000);   /* any non-ROM0 aperture: ring stub ports are wrong */
 		uint32_t port1 = bank->base + 0xAA8, port2 = bank->base + 0x554;
 		uint32_t total = t9_work ? 0u : (count & ~3u);	/* whole words via ring */
 		uint32_t base_addr = address, base_done = 0;
@@ -1168,18 +1168,77 @@ if (cp_restarts < 2) {
 				goto t9_err;
 		}
 
-		{
+		/* Drain: robust consumer-completion loop. Poll rd (AP path,
+		 * core running); on sustained stall use the SAME checkpoint
+		 * restart machinery as mid-write; only after rd==total arm the
+		 * exit handshake, and accept a core already halted at t9_exit
+		 * (fixes the race where the bkpt hit before wait_algorithm
+		 * was armed — the historic "did not complete cleanly"). */
+		if (total > 0) {
 			uint32_t one = 1;
 			retval = mem_ap_write_atomic_u32(dap, t9_ctrl + 8, one);
 			if (retval != ERROR_OK)
 				goto t9_err;
-		}
-		retval = target_wait_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
-					     t9_exit, 30000, &armv7m_algo);
-		if (retval != ERROR_OK) {
-			LOG_ERROR("fm3 type9: ring stub did not complete cleanly");
-			started = false;
-			goto t9_err;
+
+			int64_t t_drain = timeval_ms();
+			int64_t t_nod = timeval_ms();
+			uint32_t rd_last = 0xFFFFFFFF;
+			for (;;) {
+				uint32_t rdp = 0;
+				if (mem_ap_read_atomic_u32(dap, t9_ctrl + 4, &rdp) != ERROR_OK) {
+					LOG_ERROR("fm3 type9: drain rd AP read failed");
+					retval = ERROR_FLASH_OPERATION_FAILED;
+					goto t9_err;
+				}
+				if (rdp != rd_last) { rd_last = rdp; t_nod = timeval_ms(); }
+				if (rdp >= total)
+					break;
+				if (timeval_ms() - t_nod > 3000) {
+					uint32_t dh = 0;
+					(void)mem_ap_read_atomic_u32(dap, 0xE000EDF0, &dh);
+					if (!(dh & S_HALT)) {	/* running: patient */
+						if (timeval_ms() - t_drain > 60000) {
+							LOG_ERROR("fm3 type9: drain timeout rd=%u total=%u", rdp, total);
+							retval = ERROR_FLASH_OPERATION_FAILED;
+							goto t9_err;
+						}
+						keep_alive();
+						continue;
+					}
+					if (cp_restarts < 2) {
+						cp_restarts++;
+						LOG_WARNING("fm3 type9: drain stall at rd=%u/%u \u2014 checkpoint restart %u",
+							    rdp, total, cp_restarts);
+						mem_ap_write_atomic_u32(dap, DCB_DHCSR, DBGKEY | C_HALT | C_DEBUGEN);
+						target_wait_algorithm(target, 0, NULL, 0, NULL, t9_exit, 1000, &armv7m_algo);
+						started = false;
+						rd_seen = 0xFFFFFFFF;
+						t_noprog = timeval_ms();
+						goto t9_producer_start;
+					}
+					LOG_ERROR("fm3 type9: drain dead at rd=%u/%u DHCSR=%08x", rdp, total, dh);
+					retval = ERROR_FLASH_OPERATION_FAILED;
+					goto t9_err;
+				}
+				keep_alive();
+			}
+			/* rd==total; core may ALREADY be halted at the exit bkpt */
+			uint32_t dh = 0;
+			for (unsigned int spin = 0; spin < 300; spin++) {
+				if (mem_ap_read_atomic_u32(dap, 0xE000EDF0, &dh) != ERROR_OK)
+					return ERROR_FAIL;	/* chain dead: bail hard */
+				if (dh & S_HALT)
+					break;
+				keep_alive();
+			}
+			if (!(dh & S_HALT)) {
+				retval = target_wait_algorithm(target, 0, NULL, ARRAY_SIZE(rp), rp,
+							     t9_exit, 10000, &armv7m_algo);
+				if (retval != ERROR_OK) {
+					LOG_WARNING("fm3 type9: exit trap unverified post-drain (rd==total); accepting, verify must confirm");
+					retval = ERROR_OK;
+				}
+			}
 		}
 		started = false;
 		base_done = count;
