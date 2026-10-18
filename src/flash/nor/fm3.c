@@ -369,6 +369,7 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
 		/* Pure host-side sequence (mirrors vendor bootloader). */
+		uint32_t port1 = bank->base + 0xAA8, port2 = bank->base + 0x554;
 		/* disable HW watchdog: a WDT reset mid-erase corrupts the
 		 * target sector (manual caution: "prevent an unexpected reset
 		 * like Watchdog Timer from occurring during writing/erasing")
@@ -396,13 +397,14 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 				fm3_type9_read_reset(target, bank->base);
 				return retval;
 			}
-			/* sector erase setup */
-			retval  = target_write_u16(target, 0x00000AA8, 0x00AA);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x0080);
+			/* sector erase setup (command ports live inside the
+			 * target ROM's aperture: bank base + offsets) */
+			retval  = target_write_u16(target, port1, 0x00AA);
+			if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
+			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x0080);
 			/* sector erase confirm */
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00AA);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
+			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
+			if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
 			if (retval == ERROR_OK) retval = target_write_u16(target, sector_base, 0x0030);
 			if (retval != ERROR_OK) {
 				LOG_ERROR("fm3 type9 erase command fault sector %u", sector);
@@ -902,7 +904,14 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		const uint32_t t9_ring = 0x1FFFC800;
 		const uint32_t t9_size = 8192;
 		const uint32_t t9_exit = t9_code + 0x58;
-		uint32_t total = count & ~3u;	/* whole words via ring */
+		/* The ring stub pokes ROM0-aperture command ports (0xAA8/
+		 * 0x0554); the manual requires command writes inside the
+		 * target ROM's range, so the work-area bank (base
+		 * 0x00200000) is programmed by the host-side halfword
+		 * loop below: total = 0 routes everything there. */
+		const bool t9_work = (bank->base != 0x00000000);
+		uint32_t port1 = bank->base + 0xAA8, port2 = bank->base + 0x554;
+		uint32_t total = t9_work ? 0u : (count & ~3u);	/* whole words via ring */
 		uint32_t base_addr = address, base_done = 0;
 		const uint8_t *base_buf = buffer;
 		unsigned int cp_restarts = 0;
@@ -911,7 +920,7 @@ t9_producer_start:
 		wr = 0; rd = 0; rd_seen = 0xFFFFFFFF;
 		address = base_addr + base_done;
 		buffer = base_buf + base_done;
-		total = (count - base_done) & ~3u;
+		total = t9_work ? 0u : ((count - base_done) & ~3u);
 		(void)wr; (void)rd;
 		int64_t t_noprog = timeval_ms();
 		int64_t t_start;
@@ -1175,13 +1184,14 @@ if (cp_restarts < 2) {
 		destroy_reg_param(&rp[1]);
 		destroy_reg_param(&rp[2]);
 
-		/* program any remaining 2-byte halfword directly (host side) */
+		/* program any remaining halfwords (all of a work-area
+		 * bank) directly host-side through this bank's ports */
 		for (uint32_t off = total; off < count; off += 2) {
 			uint16_t val = buffer[off] | (buffer[off + 1] << 8);
 			retval = fm3_fstr_wait(target, 500);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00AA);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
-			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000AA8, 0x00A0);
+			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
+			if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
+			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00A0);
 			if (retval == ERROR_OK) retval = target_write_u16(target, address + off, val);
 			if (retval != ERROR_OK) {
 				LOG_ERROR("fm3 type9: tail halfword failed");
@@ -1480,42 +1490,37 @@ static int fm3_probe(struct flash_bank *bank)
 		 * memory map 2): main area = 256K as
 		 *   SA2 8K @0x00000, SA3 8K @0x02000, SA8 48K @0x04000,
 		 *   SA9 64K @0x10000, SA10 64K @0x20000, SA11 64K @0x30000.
-		 * Reads above 0x40000 alias the main area; the 32K "work
-		 * area" lives at 0x200000+ behind its own aperture and is
-		 * not part of this bank. */
-		bank->size = 256 * 1024;
-		bank->num_sectors = 6;
-		bank->sectors[0].offset = 0x00000;	bank->sectors[0].size =  8 * 1024;
-		bank->sectors[1].offset = 0x02000;	bank->sectors[1].size =  8 * 1024;
-		bank->sectors[2].offset = 0x04000;	bank->sectors[2].size = 48 * 1024;
-		bank->sectors[3].offset = 0x10000;	bank->sectors[3].size = 64 * 1024;
-		bank->sectors[4].offset = 0x20000;	bank->sectors[4].size = 64 * 1024;
-		bank->sectors[5].offset = 0x30000;	bank->sectors[5].size = 64 * 1024;
-		for (unsigned int i = 0; i < 6; i++) {
-			bank->sectors[i].is_erased = -1;
-			bank->sectors[i].is_protected = 0;
-		}
-	}
-
-	if (fm3_info->flashtype == FM3_FLASH_TYPE9) {
-		/* Real TYPE9 erase-unit map (MB9B320M datasheet 002-05652,
-		 * memory map 2): main area = 256K as
-		 *   SA2 8K @0x00000, SA3 8K @0x02000, SA8 48K @0x04000,
-		 *   SA9 64K @0x10000, SA10 64K @0x20000, SA11 64K @0x30000.
-		 * Reads above 0x40000 alias the main area; the 32K "work
-		 * area" lives at 0x200000+ behind its own aperture and is
-		 * not part of this bank. */
-		bank->size = 256 * 1024;
-		bank->num_sectors = 6;
-		bank->sectors[0].offset = 0x00000;	bank->sectors[0].size =  8 * 1024;
-		bank->sectors[1].offset = 0x02000;	bank->sectors[1].size =  8 * 1024;
-		bank->sectors[2].offset = 0x04000;	bank->sectors[2].size = 48 * 1024;
-		bank->sectors[3].offset = 0x10000;	bank->sectors[3].size = 64 * 1024;
-		bank->sectors[4].offset = 0x20000;	bank->sectors[4].size = 64 * 1024;
-		bank->sectors[5].offset = 0x30000;	bank->sectors[5].size = 64 * 1024;
-		for (unsigned int i = 0; i < 6; i++) {
-			bank->sectors[i].is_erased = -1;
-			bank->sectors[i].is_protected = 0;
+		 * Reads above 0x40000 alias the main area.
+		 * The 32K "work area" (second flash per 002-04795 §1.2;
+		 * SA4..SA7, 4x8K at 0x0020_0000..0x0020_8000, holding
+		 * e.g. Realforce per-key calibration data) is exposed as
+		 * a SECOND bank declared at base 0x00200000; its command
+		 * ports are derived from the bank base below. TYPE9-11
+		 * have no FSTR1 (TRM 002-05586 appendix), so both areas
+		 * report through the single FSTR - we only ever run one
+		 * operation at a time, so that is sufficient. */
+		if (bank->base == 0x00200000) {
+			bank->size = 32 * 1024;
+			bank->num_sectors = 4;
+			for (unsigned int i = 0; i < 4; i++) {
+				bank->sectors[i].offset = i * 8 * 1024;
+				bank->sectors[i].size = 8 * 1024;
+				bank->sectors[i].is_erased = -1;
+				bank->sectors[i].is_protected = 0;
+			}
+		} else {
+			bank->size = 256 * 1024;
+			bank->num_sectors = 6;
+			bank->sectors[0].offset = 0x00000;	bank->sectors[0].size =  8 * 1024;
+			bank->sectors[1].offset = 0x02000;	bank->sectors[1].size =  8 * 1024;
+			bank->sectors[2].offset = 0x04000;	bank->sectors[2].size = 48 * 1024;
+			bank->sectors[3].offset = 0x10000;	bank->sectors[3].size = 64 * 1024;
+			bank->sectors[4].offset = 0x20000;	bank->sectors[4].size = 64 * 1024;
+			bank->sectors[5].offset = 0x30000;	bank->sectors[5].size = 64 * 1024;
+			for (unsigned int i = 0; i < 6; i++) {
+				bank->sectors[i].is_erased = -1;
+				bank->sectors[i].is_protected = 0;
+			}
 		}
 	}
 
