@@ -1348,7 +1348,10 @@ static int fm3_probe(struct flash_bank *bank)
 	fm3_info->probed = false;
 
 	bank->sectors = malloc(sizeof(struct flash_sector) * num_pages);
-	bank->base = 0x00000000;
+	/* NB: bank->base comes from the 'flash bank' declaration and MUST be
+	 * preserved — the work-area second bank is declared at 0x00200000 and
+	 * the TYPE9 geometry/command-port logic keys off it. (Was: hardcoded
+	 * 0x00000000, which silently gave every bank the main-area map.) */
 	bank->size = 32 * 1024;		/* bytes */
 
 	bank->sectors[0].offset = 0;
