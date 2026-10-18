@@ -12,6 +12,7 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
+#include <stdlib.h>
 
 #include "imp.h"
 #include <helper/binarybuffer.h>
@@ -196,6 +197,8 @@ static int fm3_fstr_wait(struct target *target, int timeout_ms)
  * on hardware, no power cycle needed. Healing *mid-write* is left to
  * session boundaries (jtag/unstick.sh): a freshly healed macro can
  * still hang a ring launch in the same session (latch residue). */
+#define ERROR_HEAL_RESTART_SESSION	(-601)
+
 static int fm3_type9_heal(struct target *target, uint32_t bank_base)
 {
 	uint32_t port1 = bank_base + 0xAA8, port2 = bank_base + 0x554;
@@ -220,8 +223,27 @@ static int fm3_type9_heal(struct target *target, uint32_t bank_base)
 			if (target_read_u16(target, 0x40000008, &f) != ERROR_OK)
 				break;
 			if (f & 1) {
-				LOG_INFO("fm3 type9: macro healed via %s",
+				LOG_INFO("fm3 type9: macro ready after %s",
 					 (cmd == 0x00F0) ? "Read-Reset" : "Resume");
+				/* Resume RESTARTS the suspended operation - it does not
+				 * abort it. Always finish with Read/Reset (0xF0) so the
+				 * FSM lands in idle array-read state, else the next
+				 * erase/program re-suspends and hangs. */
+				if (target_write_u16(target, port1, 0x00AA) == ERROR_OK)
+					(void)target_write_u16(target, port2, 0x0055);
+				if (target_write_u16(target, port1, 0x00F0) == ERROR_OK) {
+					for (int q = 0; q < 20; q++) {
+						keep_alive();
+						uint16_t g = 0;
+						if (target_read_u16(target, 0x40000008, &g)
+							    == ERROR_OK && (g & 1))
+							/* Healed, but same-session ring launch can
+							 * still hang (latch residue clears only on
+							 * a new boot/session): ask for a rerun. */
+							return ERROR_HEAL_RESTART_SESSION;
+						usleep(100000);
+					}
+				}
 				return ERROR_OK;
 			}
 			usleep(100000);
@@ -1702,9 +1724,25 @@ static int fm3_probe(struct flash_bank *bank)
 		}
 	}
 
+	/* Heal runs only when FM3_HEAL=1 is set in the environment: the
+	 * heal itself is proven, but post-heal same-or-next-session ring
+	 * writes are still flaky for some jam classes; the certified flow
+	 * (heal session + fresh write session, jtag/unstick.sh) remains
+	 * the recovery of record until the latch-residue behaviour is
+	 * fully decoded. */
 	if (fm3_info->flashtype == FM3_FLASH_TYPE9 && bank->target &&
-		fm3_type9_heal(bank->target, bank->base) != ERROR_OK)
-		LOG_WARNING("fm3 type9: probe-time heal failed on %s", bank->name);
+		getenv("FM3_HEAL")) {
+		int hr = fm3_type9_heal(bank->target, bank->base);
+		if (hr == ERROR_HEAL_RESTART_SESSION) {
+			/* Macro recovered, but its latch residue reliably clears
+			 * only via a new session (device boot's own macro init is
+			 * part of the cleanup). Fail this command politely. */
+			LOG_INFO("fm3 type9: macro healed - rerun the command");
+			return ERROR_FAIL;
+		}
+		if (hr != ERROR_OK)
+			LOG_WARNING("fm3 type9: probe-time heal failed on %s", bank->name);
+	}
 	fm3_info->probed = true;
 
 	return ERROR_OK;
