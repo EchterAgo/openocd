@@ -1568,6 +1568,103 @@ static int fm3_chip_erase(struct flash_bank *bank)
 		return ERROR_TARGET_NOT_HALTED;
 	}
 
+	if (u32_flash_type == FM3_FLASH_TYPE9) {
+		/* TYPE9 generation (002-04795 Table 1-2): flash erase is the
+		 * six-write sequence ending with 0x10 at the port1 aperture;
+		 * status via FSTR (legacy data polling & FASZR do not exist
+		 * on this macro generation).  Datasheet 002-05652: chip erase
+		 * typ 6.8 s / max 18 s.  Manual: flash erase ALSO erases the
+		 * security code and the factory CR trimming data, and the
+		 * CRTRMM mirror goes blank after the internal reset the
+		 * manual's note recommends - save/restore the trim around it
+		 * (TRM 002-05586 ch. 2-2: "save the data before erasing"). */
+		uint32_t port1 = bank->base + 0xAA8, port2 = bank->base + 0x554;
+		uint32_t crtrmm = 0;
+		uint16_t sec = 0xFFFF;
+
+		/* disable HW watchdog (branch precedes the legacy shared
+		 * block; a WDT bite mid-erase corrupts the flash) */
+		retval = target_write_u32(target, 0x40011C00, 0x1ACCE551);
+		if (retval == ERROR_OK)
+			retval = target_write_u32(target, 0x40011C00, 0xE5331AAE);
+		if (retval == ERROR_OK)
+			retval = target_write_u32(target, 0x40011008, 0);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: watchdog disable failed");
+			return retval;
+		}
+		if (fm3_type9_force_halt(target) != ERROR_OK) {
+			LOG_ERROR("fm3 type9: cannot force halt before chip erase");
+			return ERROR_FAIL;
+		}
+		/* factory state before we wipe it */
+		retval = target_read_u32(target, 0x40000100 /* CRTRMM */, &crtrmm);
+		if (retval == ERROR_OK)
+			retval = target_read_u16(target, 0x00100000, &sec);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: cannot read CRTRMM/security state");
+			return retval;
+		}
+		if (sec == 0x0001)
+			LOG_WARNING("fm3 type9: flash security was ENABLED; chip "
+				    "erase releases it (manual chapter 2)");
+		retval = fm3_type9_reset(target);
+		if (retval != ERROR_OK)
+			return retval;
+		/* erase ROM0 (main): unlock AA/55/80/AA/55 then 0x10 */
+		retval  = target_write_u16(target, port1, 0x00AA);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x0080);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x0010);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9 chip erase command fault");
+			return retval;
+		}
+		retval = fm3_fstr_wait(target, 20000);
+		if (retval != ERROR_OK) {
+			fm3_type9_read_reset(target, bank->base);
+			return retval;
+		}
+		for (unsigned int i = 0; i < bank->num_sectors; i++)
+			bank->sectors[i].is_erased = 1;
+		if (bank->base == 0x00000000 &&
+		    crtrmm != 0 && crtrmm != 0xFFFFFFFF) {
+			/* reprogram the CR trimming halves (TYPE9
+			 * geometry per 002-05652: CR area @0x0010_2000:
+			 * +0 freq trim (10 bit), +2 temp trim (5 bit)) */
+			uint16_t ftrim = crtrmm & 0x3FF;
+			uint16_t ttrim = (crtrmm >> 16) & 0x1F;
+			for (int half = 0; half < 2; half++) {
+				uint32_t craddr = 0x00102000 + half * 2;
+				uint16_t val = half ? ttrim : ftrim;
+				if (half && ttrim == 0)
+					break;	/* no temp data to restore */
+				retval = fm3_fstr_wait(target, 1500);
+				if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
+				if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
+				if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00A0);
+				if (retval == ERROR_OK) retval = target_write_u16(target, craddr, val);
+				if (retval == ERROR_OK) retval = fm3_fstr_wait(target, 500);
+				if (retval != ERROR_OK) {
+					fm3_type9_read_reset(target, bank->base);
+					LOG_ERROR("fm3 type9: CR trimming restore "
+						  "FAILED (trim=%03x/%01x lost!)",
+						  ftrim, ttrim);
+					return retval;
+				}
+			}
+			LOG_INFO("fm3 type9: CR trimming data restored "
+				 "(freq=%03x temp=%01x)", ftrim, ttrim);
+		} else if (bank->base == 0x00000000) {
+			LOG_WARNING("fm3 type9: no CR trimming mirror data "
+				    "found; chip erase leaves HOCO uncalibrated");
+		}
+		LOG_INFO("fm3 type9: chip erase complete");
+		return ERROR_OK;
+	}
+
 	/* RAMCODE used for fm3 Flash chip erase:				   */
 	/* R0 keeps Flash Sequence address 1     (u32FlashSeq1)    */
 	/* R1 keeps Flash Sequence address 2     (u32FlashSeq2)    */
