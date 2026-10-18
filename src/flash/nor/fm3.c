@@ -143,26 +143,54 @@ FLASH_BANK_COMMAND_HANDLER(fm3_flash_bank_command)
 }
 
 
-/* FSTR bit0 polling via bit-band alias (flash macro type 9-12) */
+/* FSTR bit1 polling via full-byte reads (flash macro type 9-12).
+ * Per flash programming manual 002-04795 (figure 1-6, section 1.3.4):
+ * - the first FSTR read after issuing a command is undefined, always
+ *   discard one dummy read first,
+ * - bit1 HNG latches when the on-chip algorithm exceeds its internal
+ *   time limit and RDY then never returns: report it instead of
+ *   timing out silently (sector erase is specified up to 2.7 s). */
 static int fm3_fstr_wait(struct target *target, int timeout_ms)
 {
 	int ms = 0;
-	uint8_t state;
+	uint8_t fstr;
 	int retval;
 
+	/* dummy read - see manual caution above */
+	retval = target_read_u8(target, 0x40000008, &fstr);
+	if (retval != ERROR_OK)
+		return retval;
+
 	while (1) {
-		retval = target_read_u8(target, 0x42000100, &state);
+		/* RDY = bit0 of FSTR @ 0x40000008 (bit-band alias kept as
+		 * reference: 0x42000100) */
+		retval = target_read_u8(target, 0x40000008, &fstr);
 		if (retval != ERROR_OK)
 			return retval;
-		if (state)
+		if (fstr & BIT(1)) {
+			LOG_ERROR("FSTR HNG set: flash automatic algorithm "
+				  "time limit exceeded (issue read/reset 0xF0)");
+			return ERROR_FLASH_OPERATION_FAILED;
+		}
+		if (fstr & BIT(0))
 			return ERROR_OK;
 		keep_alive();
 		usleep(1000);
 		if (++ms > timeout_ms) {
-			LOG_ERROR("FSTR poll timed out after %d ms", ms);
+			LOG_ERROR("FSTR poll timed out after %d ms (FSTR=%02" PRIx8 ")",
+				  ms, fstr);
 			return ERROR_FLASH_OPERATION_FAILED;
 		}
 	}
+}
+
+/* Manual-defined recovery from a HANG state: the Read/Reset command is a
+ * single 0xF0 write to any address inside the target ROM's aperture; it
+ * returns the macro to read mode and clears HNG. */
+static void fm3_type9_read_reset(struct target *target, uint32_t rom_base)
+{
+	if (target_write_u16(target, rom_base + 0x1000, 0x00F0) == ERROR_OK)
+		LOG_INFO("fm3 type9: read/reset command issued to recover macro");
 }
 
 /* Data polling algorithm */
@@ -341,6 +369,19 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
 		/* Pure host-side sequence (mirrors vendor bootloader). */
+		/* disable HW watchdog: a WDT reset mid-erase corrupts the
+		 * target sector (manual caution: "prevent an unexpected reset
+		 * like Watchdog Timer from occurring during writing/erasing")
+		 * and the core being halt-ed does not stop the counter */
+		retval = target_write_u32(target, 0x40011C00, 0x1ACCE551);
+		if (retval == ERROR_OK)
+			retval = target_write_u32(target, 0x40011C00, 0xE5331AAE);
+		if (retval == ERROR_OK)
+			retval = target_write_u32(target, 0x40011008, 0x00000000);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9: watchdog disable failed");
+			return retval;
+		}
 		if (fm3_type9_force_halt(target) != ERROR_OK) {
 			LOG_ERROR("fm3 type9: cannot force halt before erase");
 			return ERROR_FAIL;
@@ -351,8 +392,10 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 		for (unsigned int sector = first; sector <= last; sector++) {
 			uint32_t sector_base = bank->base + bank->sectors[sector].offset;
 			retval = fm3_fstr_wait(target, 1500);
-			if (retval != ERROR_OK)
+			if (retval != ERROR_OK) {
+				fm3_type9_read_reset(target, bank->base);
 				return retval;
+			}
 			/* sector erase setup */
 			retval  = target_write_u16(target, 0x00000AA8, 0x00AA);
 			if (retval == ERROR_OK) retval = target_write_u16(target, 0x00000554, 0x0055);
@@ -365,9 +408,13 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 				LOG_ERROR("fm3 type9 erase command fault sector %u", sector);
 				return retval;
 			}
+			/* datasheet 002-05652: sector erase typ 1.1 s / max 2.7 s
+			 * (large), max 0.9 s (small) */
 			retval = fm3_fstr_wait(target, 3000);
-			if (retval != ERROR_OK)
+			if (retval != ERROR_OK) {
+				fm3_type9_read_reset(target, bank->base);
 				return retval;
+			}
 			bank->sectors[sector].is_erased = 1;
 		}
 		return ERROR_OK;
@@ -536,15 +583,15 @@ static int t9_bulk_write(struct adiv5_ap *ap, uint32_t addr,
 	return retval;
 }
 
-/* Reset macro command FSM + sticky flags: a connect-halt may have caught
- * the core between the AA/55 unlock writes, leaving the macro armed and
- * first stub/AP command then errors (FSTR never ready). */
+/* Reset macro error state before an operation: clear sticky interrupt
+ * flags (FICLR) and make sure the macro reports RDY.  Manual 002-04795
+ * also defines a Read/Reset command (single 0xF0 write inside the ROM
+ * aperture) for escaping a HANG; see fm3_type9_read_reset() - note the
+ * vendor-bootloader-derived field experience that a *wrong* command
+ * (not 0xF0) can wedge this macro generation until power cycle, so we
+ * only ever issue the defined one. */
 static int fm3_type9_reset(struct target *target)
 {
-	/* clear sticky macro error flags only; undefined commands on this
-	 * macro generation latch FCUFE and wedge the sequencer, so there is
-	 * no software "read reset" here — an INITX/power cycle is the
-	 * recovery for a stuck command FSM. */
 	int retval = target_write_u16(target, 0x40000028, 0xFFFF); /* FICLR: W1C all */
 	if (retval == ERROR_OK)
 		retval = fm3_fstr_wait(target, 1000);
@@ -555,7 +602,7 @@ static int fm3_type9_reset(struct target *target)
  *
  * Reassemble with: arm-none-eabi-as -mthumb -o t9_stub.o t9_stub.S
  *                  arm-none-eabi-objcopy -O binary t9_stub.o t9_stub.bin
- * (source kept verbatim below; 92 bytes, bkpt at +0x56).
+ * (source kept verbatim below; 94 bytes, bkpt at +0x58).
  *
  * Must run from 0x1FFFC100, the vendor bootloader's own RAM-code
  * island: the 0x20000000 RAM is not executable on these parts, and
@@ -592,6 +639,8 @@ static int fm3_type9_reset(struct target *target)
  * 	b loop
  * have:
  * waitf:
+ * 	ldrb r6, [r7]	@ dummy: first FSTR read after a command is
+ * 			@ undefined (manual 002-04795 fig 1-6)
  * 	ldrb r6, [r7]
  * 	cmp r6, #0
  * 	beq waitf
@@ -618,11 +667,11 @@ static const uint8_t t9_stub[] = {
 	0x72, 0xb6, 0x2d, 0xe9, 0xf0, 0x53, 0x40, 0xf2, 0x00, 0x17, 0xc4, 0xf2,
 	0x00, 0x27, 0x40, 0xf6, 0xa8, 0x28, 0x40, 0xf2, 0x54, 0x59, 0x41, 0xf6,
 	0xff, 0x7c, 0x1c, 0x68, 0x5d, 0x68, 0xac, 0x42, 0x03, 0xd1, 0x9a, 0x68,
-	0x00, 0x2a, 0x16, 0xd1, 0xf7, 0xe7, 0x3e, 0x78, 0x00, 0x2e, 0xfc, 0xd0,
-	0xaa, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x55, 0x26, 0xa9, 0xf8, 0x00, 0x60,
-	0xa0, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x2e, 0x46, 0x16, 0xea, 0x0c, 0x06,
-	0x76, 0x18, 0x34, 0x88, 0x04, 0x80, 0x02, 0x30, 0x02, 0x35, 0x5d, 0x60,
-	0xe1, 0xe7, 0x00, 0xbe, 0xbd, 0xe8, 0xf0, 0x93,
+	0x00, 0x2a, 0x17, 0xd1, 0xf7, 0xe7, 0x3e, 0x78, 0x3e, 0x78, 0x00, 0x2e,
+	0xfb, 0xd0, 0xaa, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x55, 0x26, 0xa9, 0xf8,
+	0x00, 0x60, 0xa0, 0x26, 0xa8, 0xf8, 0x00, 0x60, 0x2e, 0x46, 0x16, 0xea,
+	0x0c, 0x06, 0x76, 0x18, 0x34, 0x88, 0x04, 0x80, 0x02, 0x30, 0x02, 0x35,
+	0x5d, 0x60, 0xe0, 0xe7, 0x00, 0xbe, 0xbd, 0xe8, 0xf0, 0x93,
 };
 
 /* Force the core into a *verified* halt through the debug AP. A core
@@ -852,15 +901,14 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		const uint32_t t9_ctrl = 0x1FFFC400;
 		const uint32_t t9_ring = 0x1FFFC800;
 		const uint32_t t9_size = 8192;
-		const uint32_t t9_exit = t9_code + 0x56;
+		const uint32_t t9_exit = t9_code + 0x58;
 		uint32_t total = count & ~3u;	/* whole words via ring */
 		uint32_t base_addr = address, base_done = 0;
 		const uint8_t *base_buf = buffer;
 		unsigned int cp_restarts = 0;
 		uint32_t wr = 0, rd = 0, rd_seen = 0xFFFFFFFF;
-		unsigned int rescues = 0;
 t9_producer_start:
-		wr = 0; rd = 0; rd_seen = 0xFFFFFFFF; rescues = 0;
+		wr = 0; rd = 0; rd_seen = 0xFFFFFFFF;
 		address = base_addr + base_done;
 		buffer = base_buf + base_done;
 		total = (count - base_done) & ~3u;
@@ -912,16 +960,16 @@ t9_producer_start:
 			const uint32_t t9_vectors = 0x20002000;
 			uint8_t vtab[64 * 4];
 			for (unsigned int v = 0; v < 64; v++) {
-				uint32_t h = (t9_code + 0x60) | 1u;
+				uint32_t h = (t9_code + 0x62) | 1u;
 				vtab[v * 4 + 0] = h & 0xff;
 				vtab[v * 4 + 1] = (h >> 8) & 0xff;
 				vtab[v * 4 + 2] = (h >> 16) & 0xff;
 				vtab[v * 4 + 3] = (h >> 24) & 0xff;
 			}
 			vtab[0] = 0; vtab[1] = 0; vtab[2] = 0; vtab[3] = 0; /* SP unused path */
-			/* handler: bkpt #1 at stub end + 0x60 */
+			/* handler: bkpt #1 at stub end + 0x62 */
 			uint8_t hk[2] = { 0x01, 0xbe };
-			retval = target_write_buffer(target, t9_code + 0x60, 2, hk);
+			retval = target_write_buffer(target, t9_code + 0x62, 2, hk);
 			if (retval == ERROR_OK)
 				retval = target_write_buffer(target, t9_vectors,
 						       sizeof(vtab), vtab);
@@ -1008,7 +1056,6 @@ if (cp_restarts < 2) {
 								  &armv7m_algo);
 						started = false;
 					}
-					rescues = 0;
 					rd_seen = 0xFFFFFFFF;
 					t_start = timeval_ms();
 					goto t9_producer_start;
