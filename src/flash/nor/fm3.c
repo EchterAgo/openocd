@@ -187,6 +187,50 @@ static int fm3_fstr_wait(struct target *target, int timeout_ms)
 /* Manual-defined recovery from a HANG state: the Read/Reset command is a
  * single 0xF0 write to any address inside the target ROM's aperture; it
  * returns the macro to read mode and clears HNG. */
+/* Macro self-heal (probe time only — see fm3_probe): an interrupted
+ * operation can leave the TYPE9 FSM mid-command (FSTR READY=0, HNG/
+ * DQ5 latched; state survives SYSRESETREQ and even the INITX pin on a
+ * live-VDD board), after which every erase/program times out and the
+ * device bootloader wedges waiting on the macro. Recovery ladder:
+ * Resume (AA/55/FF) alternating with Read-Reset (AA/55/F0); verified
+ * on hardware, no power cycle needed. Healing *mid-write* is left to
+ * session boundaries (jtag/unstick.sh): a freshly healed macro can
+ * still hang a ring launch in the same session (latch residue). */
+static int fm3_type9_heal(struct target *target, uint32_t bank_base)
+{
+	uint32_t port1 = bank_base + 0xAA8, port2 = bank_base + 0x554;
+	for (int round = 0; round < 3; round++) {
+		uint16_t fstr = 1;
+		if (target_read_u16(target, 0x40000008, &fstr) != ERROR_OK)
+			return ERROR_FAIL;
+		if (fstr & 1)
+			return ERROR_OK;
+		LOG_INFO("fm3 type9: macro hung at probe (FSTR=%04x) - heal round %d",
+			 fstr, round + 1);
+		const uint16_t cmd = (round & 1) ? 0x00F0 : 0x00FF;
+		if (target_write_u16(target, port1, 0x00AA) != ERROR_OK)
+			return ERROR_FAIL;
+		if (target_write_u16(target, port2, 0x0055) != ERROR_OK)
+			return ERROR_FAIL;
+		if (target_write_u16(target, port1, cmd) != ERROR_OK)
+			return ERROR_FAIL;
+		for (int ms = 0; ms < 2000; ms += 100) {
+			keep_alive();
+			uint16_t f = 0;
+			if (target_read_u16(target, 0x40000008, &f) != ERROR_OK)
+				break;
+			if (f & 1) {
+				LOG_INFO("fm3 type9: macro healed via %s",
+					 (cmd == 0x00F0) ? "Read-Reset" : "Resume");
+				return ERROR_OK;
+			}
+			usleep(100000);
+		}
+	}
+	LOG_ERROR("fm3 type9: macro unresponsive after 3 heal rounds");
+	return ERROR_FLASH_OPERATION_FAILED;
+}
+
 static void fm3_type9_read_reset(struct target *target, uint32_t rom_base)
 {
 	if (target_write_u16(target, rom_base + 0x1000, 0x00F0) == ERROR_OK)
@@ -1658,6 +1702,9 @@ static int fm3_probe(struct flash_bank *bank)
 		}
 	}
 
+	if (fm3_info->flashtype == FM3_FLASH_TYPE9 && bank->target &&
+		fm3_type9_heal(bank->target, bank->base) != ERROR_OK)
+		LOG_WARNING("fm3 type9: probe-time heal failed on %s", bank->name);
 	fm3_info->probed = true;
 
 	return ERROR_OK;
