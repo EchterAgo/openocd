@@ -193,6 +193,52 @@ static void fm3_type9_read_reset(struct target *target, uint32_t rom_base)
 		LOG_INFO("fm3 type9: read/reset command issued to recover macro");
 }
 
+/* Edge-latched flash status flags (manual 002-04795 sections
+ * 1.4.4/1.4.5): FISR.RDYIF and FISR.HANGIF are SET BY HARDWARE on the
+ * rising edges of the macro's internal RDY / HANG signals and hold
+ * until cleared through FICLR.  Unlike FSTR level polling they can
+ * never miss a completion pulse (no "first read undefined" hazard, no
+ * race against a fast operation) and a hang is reported the instant
+ * the macro latches it.  FICR's RDYIE/HANGIE only gate the CPU
+ * interrupt wire - the flags latch regardless, so we leave FICR at 0
+ * and consume the flags purely through the debug AP.
+ * Usage pattern: fm3_type9_fisr_clear() BEFORE issuing the command,
+ * then fm3_type9_wait_fisr() to harvest the completion edge. */
+static int fm3_type9_fisr_clear(struct target *target)
+{
+	return target_write_u16(target, 0x40000028, 0x0003); /* FICLR: HANGC|RDYC */
+}
+
+static int fm3_type9_wait_fisr(struct target *target, int timeout_ms)
+{
+	int ms = 0;
+	uint8_t fisr;
+	int retval;
+
+	while (1) {
+		retval = target_read_u8(target, 0x40000024, &fisr); /* FISR */
+		if (retval != ERROR_OK)
+			return retval;
+		if (fisr & BIT(1)) {
+			LOG_ERROR("FISR HANGIF latched: macro internal time "
+				  "limit exceeded (read/reset needed)");
+			return ERROR_FLASH_OPERATION_FAILED;
+		}
+		if (fisr & BIT(0))
+			return ERROR_OK;	/* RDYIF: completion edge caught */
+		keep_alive();
+		usleep(1000);
+		if (++ms > timeout_ms) {
+			uint8_t fstr = 0;
+			(void)target_read_u8(target, 0x40000008, &fstr);
+			LOG_ERROR("FISR wait timed out after %d ms "
+				  "(FISR=%02" PRIx8 " FSTR=%02" PRIx8 ")",
+				  ms, fisr, fstr);
+			return ERROR_FLASH_OPERATION_FAILED;
+		}
+	}
+}
+
 /* Data polling algorithm */
 static int fm3_busy_wait(struct target *target, uint32_t offset, int timeout_ms)
 {
@@ -1248,10 +1294,13 @@ if (cp_restarts < 2) {
 
 t9_host_loop:
 		/* program any remaining halfwords (all of a work-area
-		 * bank) directly host-side through this bank's ports */
+		 * bank) directly host-side through this bank's ports.
+		 * FISR edge-flag scheme: clear stale flags, fire the
+		 * write command, harvest the latched completion edge
+		 * (datasheet: halfword program max 310 us). */
 		for (uint32_t off = total; off < count; off += 2) {
 			uint16_t val = buffer[off] | (buffer[off + 1] << 8);
-			retval = fm3_fstr_wait(target, 500);
+			retval = fm3_type9_fisr_clear(target);
 			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
 			if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
 			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00A0);
@@ -1260,9 +1309,11 @@ t9_host_loop:
 				LOG_ERROR("fm3 type9: tail halfword failed");
 				return retval;
 			}
-			retval = fm3_fstr_wait(target, 1000);
-			if (retval != ERROR_OK)
+			retval = fm3_type9_wait_fisr(target, 1000);
+			if (retval != ERROR_OK) {
+				fm3_type9_read_reset(target, bank->base);
 				return retval;
+			}
 		}
 		/* The island RAM we occupied may have been the app's live
 		 * vectors/code; never leave the core running after this. */
@@ -1683,7 +1734,8 @@ static int fm3_chip_erase(struct flash_bank *bank)
 		if (retval != ERROR_OK)
 			return retval;
 		/* erase ROM0 (main): unlock AA/55/80/AA/55 then 0x10 */
-		retval  = target_write_u16(target, port1, 0x00AA);
+		retval  = fm3_type9_fisr_clear(target);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
 		if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
 		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x0080);
 		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
@@ -1693,7 +1745,7 @@ static int fm3_chip_erase(struct flash_bank *bank)
 			LOG_ERROR("fm3 type9 chip erase command fault");
 			return retval;
 		}
-		retval = fm3_fstr_wait(target, 20000);
+		retval = fm3_type9_wait_fisr(target, 20000);
 		if (retval != ERROR_OK) {
 			fm3_type9_read_reset(target, bank->base);
 			return retval;
@@ -1712,12 +1764,12 @@ static int fm3_chip_erase(struct flash_bank *bank)
 				uint16_t val = half ? ttrim : ftrim;
 				if (half && ttrim == 0)
 					break;	/* no temp data to restore */
-				retval = fm3_fstr_wait(target, 1500);
+				retval = fm3_type9_fisr_clear(target);
 				if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
 				if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
 				if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00A0);
 				if (retval == ERROR_OK) retval = target_write_u16(target, craddr, val);
-				if (retval == ERROR_OK) retval = fm3_fstr_wait(target, 500);
+				if (retval == ERROR_OK) retval = fm3_type9_wait_fisr(target, 1000);
 				if (retval != ERROR_OK) {
 					fm3_type9_read_reset(target, bank->base);
 					LOG_ERROR("fm3 type9: CR trimming restore "
