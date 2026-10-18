@@ -436,35 +436,52 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 		retval = fm3_type9_reset(target);
 		if (retval != ERROR_OK)
 			return retval;
-		for (unsigned int sector = first; sector <= last; sector++) {
-			uint32_t sector_base = bank->base + bank->sectors[sector].offset;
-			retval = fm3_fstr_wait(target, 1500);
-			if (retval != ERROR_OK) {
-				fm3_type9_read_reset(target, bank->base);
-				return retval;
-			}
-			/* sector erase setup (command ports live inside the
-			 * target ROM's aperture: bank base + offsets) */
-			retval  = target_write_u16(target, port1, 0x00AA);
-			if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
-			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x0080);
-			/* sector erase confirm */
-			if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
-			if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
-			if (retval == ERROR_OK) retval = target_write_u16(target, sector_base, 0x0030);
-			if (retval != ERROR_OK) {
-				LOG_ERROR("fm3 type9 erase command fault sector %u", sector);
-				return retval;
-			}
-			/* datasheet 002-05652: sector erase typ 1.1 s / max 2.7 s
-			 * (large), max 0.9 s (small) */
-			retval = fm3_fstr_wait(target, 3000);
-			if (retval != ERROR_OK) {
-				fm3_type9_read_reset(target, bank->base);
-				return retval;
-			}
-			bank->sectors[sector].is_erased = 1;
+		/* Multi-sector batched erase (manual Table 1-2 note,
+		 * section 1.3.3.4 + figure 1-7): after the five unlock
+		 * writes, repeat SA-address + 0xE0 to ADD each sector
+		 * of one erase set, and finish with the LAST sector's
+		 * address + 0x30 to start a single automatic algorithm
+		 * that erases the whole set. Replaces N command
+		 * sequences + N full-duration waits with 5+N writes +
+		 * one wait (full-bank erase: 11 writes instead of 36).
+		 * first==last degenerates to the proven plain 6-write
+		 * sequence. 0xE0 cannot start the erase by itself;
+		 * added sectors must belong to the ROM that issues
+		 * the command - all ours do (same bank). */
+		retval = fm3_fstr_wait(target, 1500);	/* macro must be idle */
+		if (retval != ERROR_OK) {
+			fm3_type9_read_reset(target, bank->base);
+			return retval;
 		}
+		retval = fm3_type9_fisr_clear(target);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x0080);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port1, 0x00AA);
+		if (retval == ERROR_OK) retval = target_write_u16(target, port2, 0x0055);
+		for (unsigned int sector = first;
+		     retval == ERROR_OK && sector < last; sector++)
+			retval = target_write_u16(target,
+					bank->base + bank->sectors[sector].offset, 0x00E0);
+		if (retval == ERROR_OK)
+			retval = target_write_u16(target,
+					bank->base + bank->sectors[last].offset, 0x0030);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("fm3 type9 erase command fault sectors %u-%u",
+				  first, last);
+			return retval;
+		}
+		/* datasheet 002-05652: single large-sector erase max 2.7 s,
+		 * whole-chip (6 sectors incl work) max 18 s -> a 3 s-per-
+		 * sector linear budget is the conservative envelope */
+		retval = fm3_type9_wait_fisr(target,
+					     3000 * (int)(last - first + 1));
+		if (retval != ERROR_OK) {
+			fm3_type9_read_reset(target, bank->base);
+			return retval;
+		}
+		for (unsigned int sector = first; sector <= last; sector++)
+			bank->sectors[sector].is_erased = 1;
 		return ERROR_OK;
 	}
 
