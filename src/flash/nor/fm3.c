@@ -922,6 +922,9 @@ t9_producer_start:
 		buffer = base_buf + base_done;
 		total = t9_work ? 0u : ((count - base_done) & ~3u);
 		(void)wr; (void)rd;
+		if (t9_work)
+			goto t9_host_loop;   /* no ring stub for the work aperture:
+							* it pokes ROM0 command ports */
 		int64_t t_noprog = timeval_ms();
 		int64_t t_start;
 		bool started = false;
@@ -1184,6 +1187,7 @@ if (cp_restarts < 2) {
 		destroy_reg_param(&rp[1]);
 		destroy_reg_param(&rp[2]);
 
+t9_host_loop:
 		/* program any remaining halfwords (all of a work-area
 		 * bank) directly host-side through this bank's ports */
 		for (uint32_t off = total; off < count; off += 2) {
