@@ -61,6 +61,15 @@ struct fm3_flash_bank {
 	enum fm3_variant variant;
 	enum fm3_flash_type flashtype;
 	bool probed;
+	/* fm3 type9 identification (TRM 002-05586 ch.15): UIDR0/1 at
+	 * 0x40000200 are factory-programmed, read-only, reset-invariant and
+	 * unique per device. Two consistent, non-degenerate reads are the
+	 * precondition for trusting ANY flash operation; a dead/floating AP
+	 * returns all-FF/all-0 or unstable values, which is precisely when
+	 * erase commands go out but write-back dies -- the exact failure
+	 * class that blanked a live bootloader. */
+	uint32_t uid0, uid1;
+	bool uid_verified;
 };
 
 static int fm3_type9_reset(struct target *target);
@@ -1742,6 +1751,43 @@ static int fm3_probe(struct flash_bank *bank)
 		}
 		if (hr != ERROR_OK)
 			LOG_WARNING("fm3 type9: probe-time heal failed on %s", bank->name);
+	}
+
+	/* Refuse-to-guess identification: require two identical, non-degenerate
+	 * reads of the factory unique ID before this bank is considered
+	 * trustworthy for destructive operations. */
+	if (fm3_info->flashtype == FM3_FLASH_TYPE9 && bank->target) {
+		uint32_t u0 = 0, u1 = 0, v0 = 0, v1 = 0;
+		int rc0 = target_read_u32(bank->target, 0x40000200, &u0);
+		int rc1 = target_read_u32(bank->target, 0x40000204, &u1);
+		keep_alive();
+		int rc2 = target_read_u32(bank->target, 0x40000200, &v0);
+		int rc3 = target_read_u32(bank->target, 0x40000204, &v1);
+		if (rc0 != ERROR_OK || rc1 != ERROR_OK || rc2 != ERROR_OK ||
+		    rc3 != ERROR_OK) {
+			LOG_ERROR("fm3 type9: unique ID unreadable on %s (rc %d/%d/%d/%d) "
+				"- refusing to treat flash interface as trustworthy",
+				bank->name, rc0, rc1, rc2, rc3);
+			return ERROR_FAIL;
+		}
+		if (u0 != v0 || u1 != v1) {
+			LOG_ERROR("fm3 type9: unique ID unstable on %s "
+				"(%08" PRIx32 "/%08" PRIx32 " vs %08" PRIx32 "/%08" PRIx32 ") "
+				"- flapping debug interface; abort before any flash write",
+				bank->name, u0, u1, v0, v1);
+			return ERROR_FAIL;
+		}
+		if ((u0 == 0xFFFFFFFF && u1 == 0xFFFFFFFF) || (u0 == 0 && u1 == 0)) {
+			LOG_ERROR("fm3 type9: unique ID degenerate on %s "
+				"(%08" PRIx32 "/%08" PRIx32 ") - stuck bus pattern, refusing",
+				bank->name, u0, u1);
+			return ERROR_FAIL;
+		}
+		fm3_info->uid0 = u0;
+		fm3_info->uid1 = u1;
+		fm3_info->uid_verified = true;
+		LOG_INFO("fm3 type9: device unique ID %08" PRIx32 "%07" PRIx32
+			" verified on %s", u0, u1 & 0x1FFF, bank->name);
 	}
 	fm3_info->probed = true;
 
