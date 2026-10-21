@@ -580,8 +580,45 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 			fm3_type9_read_reset(target, bank->base);
 			return retval;
 		}
-		for (unsigned int sector = first; sector <= last; sector++)
+		/* Atomicity for free-tier: the completion edge alone does NOT
+		 * prove the array is blank (interrupted commands + latch
+		 * residue can report success over a half-erased sector, and
+		 * "erase done, write later" chains died exactly this way).
+		 * Read the whole erased range back NOW; fail loudly if any
+		 * byte is not 0xFF so the caller never builds on sand. */
+		for (unsigned int sector = first; sector <= last; sector++) {
+			uint8_t chunk[512];
+			int blank = 1;
+			for (uint32_t off = 0; off < bank->sectors[sector].size;
+			     off += sizeof(chunk)) {
+				uint32_t n = sizeof(chunk);
+				if (n > bank->sectors[sector].size - off)
+					n = bank->sectors[sector].size - off;
+				retval = target_read_buffer(target,
+						bank->base + bank->sectors[sector].offset + off,
+						n, chunk);
+				if (retval != ERROR_OK)
+					return retval;
+				for (uint32_t i = 0; i < n; i++) {
+					if (chunk[i] != 0xFF) {
+						LOG_ERROR("fm3 type9: sector %u NOT blank "
+							"after erase: +0x%05" PRIx32
+							" reads %02x (erase said done)",
+							sector, off + i, chunk[i]);
+						blank = 0;
+						break;
+					}
+				}
+				if (!blank)
+					break;
+				keep_alive();
+			}
+			if (!blank) {
+				bank->sectors[sector].is_erased = 0;
+				return ERROR_FAIL;
+			}
 			bank->sectors[sector].is_erased = 1;
+		}
 		return ERROR_OK;
 	}
 
