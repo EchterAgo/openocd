@@ -208,6 +208,29 @@ static int fm3_fstr_wait(struct target *target, int timeout_ms)
  * still hang a ring launch in the same session (latch residue). */
 #define ERROR_HEAL_RESTART_SESSION	(-601)
 
+/* Health gate for destructive ops (user doctrine: CHECK AND BAIL, do not
+ * paper over). A macro that is not in array-read/READY state at operation
+ * entry means an orphaned command from a dead session (or worse): issuing
+ * erase/program into that state is how half the flash gets silently eaten.
+ * Recovery (heal ladder / POR) is deliberately left to the operator. */
+static int fm3_type9_require_healthy(struct flash_bank *bank, const char *op)
+{
+	uint16_t fstr = 0xFFFF;
+	int rc = target_read_u16(bank->target, 0x40000008, &fstr);
+	if (rc != ERROR_OK) {
+		LOG_ERROR("fm3 type9: FSTR unreadable (rc %d) before %s on %s - "
+			"macro unresponsive, refusing", rc, op, bank->name);
+		return ERROR_FLASH_OPERATION_FAILED;
+	}
+	if (!(fstr & 1)) {
+		LOG_ERROR("fm3 type9: macro not READY before %s on %s (FSTR=%04x) - "
+			"run heal (FM3_HEAL=1 probe) or power-cycle, refusing to proceed",
+			op, bank->name, fstr);
+		return ERROR_FLASH_OPERATION_FAILED;
+	}
+	return ERROR_OK;
+}
+
 static int fm3_type9_heal(struct target *target, uint32_t bank_base)
 {
 	uint32_t port1 = bank_base + 0xAA8, port2 = bank_base + 0x554;
@@ -491,6 +514,8 @@ static int fm3_erase(struct flash_bank *bank, unsigned int first,
 	if (u32_flash_type == FM3_FLASH_TYPE9) {
 		/* Pure host-side sequence (mirrors vendor bootloader). */
 		uint32_t port1 = bank->base + 0xAA8, port2 = bank->base + 0x554;
+		if (fm3_type9_require_healthy(bank, "erase") != ERROR_OK)
+			return ERROR_FLASH_OPERATION_FAILED;
 		/* disable HW watchdog: a WDT reset mid-erase corrupts the
 		 * target sector (manual caution: "prevent an unexpected reset
 		 * like Watchdog Timer from occurring during writing/erasing")
@@ -840,6 +865,10 @@ static int fm3_write_block(struct flash_bank *bank, const uint8_t *buffer,
 	uint32_t u32_flash_type;
 	uint32_t u32_flash_seq_address1;
 	uint32_t u32_flash_seq_address2;
+
+	if ((uint32_t)fm3_info->flashtype == FM3_FLASH_TYPE9 &&
+	    fm3_type9_require_healthy(bank, "write") != ERROR_OK)
+		return ERROR_FLASH_OPERATION_FAILED;
 
 	/* Increase buffer_size if needed */
 	if (buffer_size < (target->working_area_size / 2))
